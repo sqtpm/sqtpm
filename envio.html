@@ -5,9 +5,10 @@ Para enviar um trabalho, selecione o nome do trabalho, a linguagem e
 os arquivos.
 
 <p>
-Para as linguagens Pascal e Fortran, os programas devem ser compostos
-por apenas um arquivo.  Para C e C++ qualquer número de arquivos, a
-menos que haja uma restrição indicada no enunciado do trabalho.
+Para as linguagens Pascal, Fortran e Python3, os programas devem ser
+compostos por apenas um arquivo.  Para C e C++ qualquer número de
+arquivos, a menos que haja uma restrição indicada no enunciado do
+trabalho.
 
 <p>
 Os arquivos que serão enviados devem ter nomes formados apenas por
@@ -19,6 +20,7 @@ também devem ter certos sufixos, de acordo com a linguagem:
 <li> C++: .cpp ou .h
 <li> Pascal: .pas
 <li> Fortran: .f ou .F
+<li> Python3: .py
 <li> PDF: .pdf
 </ul>
 
@@ -31,7 +33,6 @@ estado da execução.  Evite definir o valor de retorno da função main
 do seu programa com valores maiores que 127.  Convencionalmente
 retorna-se 0 quando o programa for bem sucedido.
 
-
 <p>
 O programa será avaliado pela verificação do resultado da execução com
 alguns casos-de-teste.  Cada caso-de-teste será executado
@@ -42,14 +43,14 @@ saída para outro arquivo, com um comando da forma
 programa &lt;caso.in &gt;execucao.out
 </pre>
 
-e depois a saída será comparada com a saída esperada
-usando <tt>diff</tt> 
+e depois comparando a saída com a saída esperada usando <tt>diff</tt> 
 
 <pre>
 diff execucao.out caso.out
 </pre>
 
 e usando <tt>diff</tt> ignorando a formatação
+
 <pre>
 diff -q -b -B -i -w execucao.out caso.out
 </pre>
@@ -64,5 +65,3 @@ casos-de-teste abertos.
 <p>
 Não deixe de verificar o número máximo de envios permitidos para o
 trabalho.
-
-

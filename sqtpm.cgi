@@ -1,60 +1,70 @@
 #!/usr/bin/perl -w
-# This file is part of sqtpm v6.
-# Copyright 2003-2016 Guilherme P. Telles.
-# sqtpm is distributed under WTFPL v2.
+# This file is part of sqtpm 8.
+# Copyright 2003-2021 Guilherme P. Telles.
+# sqtpm is distributed under the terms of WTFPL v2.
 
-use open ":encoding(Latin1)";
-use Time::Local;
-use Fcntl ':flock';
-use File::Find;
-use GD;
-use CGI qw(:cgi Link start_html);
-use CGI::Session qw/-ip-match/;
+use CGI qw(:standard -no_xhtml);
 use CGI::Carp 'fatalsToBrowser';
+use CGI::Session qw/-ip-match/;
 use CGI::Session::Driver::file; 
-use LWP::Simple qw(head);
+$CGI::LIST_CONTEXT_WARN = 0; 
+
+use LWP::Simple ();
+use Cwd qw(cwd);
+use Fcntl ':flock';
+use File::Basename;
+use File::Find;
+use File::Copy;
+use open ":encoding(Latin1)";
+use MIME::Base64 qw(encode_base64);
+use Time::Local;
+
+use lib dirname(__FILE__);
 use sqtpm;
 
-$CGI::POST_MAX = 1000000;
-$CGI::Session::Driver::file::FileName = 'sqtpm-sess-%s';  
-$sessiond = '/tmp';
+$CGI::POST_MAX = 100000; # bytes
+
+my $sessiond = '/tmp';
+$CGI::Session::Driver::file::FileName = 'sqtpm-%s';  
 
 umask(0007);
 
-# Some globals:
-%sys_cfg = ();
-$session = 0;
-$cgi = CGI->new;
+
+# Globals:
+my $cgi = CGI->new;
+my $session = 0;
+my %sys_cfg = ();
+
 
 # Try to retrieve session id from user agent:
-$sid = $cgi->cookie('CGISESSID') || $cgi->param('CGISESSID') || undef;
+my $sid = $cgi->cookie('CGISESSID') || $cgi->param('CGISESSID') || undef;
 
 # If the session id exists but the file don't then it must get a new session:
-(defined($sid) && !-f "$sessiond/sqtpm-sess-$sid") && (undef $sid);
-$action = param('action');
+(defined($sid) && !-f "$sessiond/sqtpm-$sid") && (undef $sid);
+
+my $action = param('action');
 
 if (!defined($sid)) {
-
   if (!defined($action)) {
     login_form();    
   }
   elsif ($action eq 'in') {
-    $uid = param('uid');
-    $pwd = param('pwd');
-
-    ($utype,$upassf) = authenticate($uid,$pwd);
-
-    # authenticate() will accept if the typed and stored passwords are
-    # both blank because sqtpm-pwd needs it this way, but not in login:
+    my $uid = param('uid');
+    my $pwd = param('pwd');
+    
+    my ($utype,$upassf) = authenticate($uid,$pwd);
+    
+    # authenticate() will accept if the typed and stored passwords are both blank because 
+    # sqtpm-pwd needs it this way, but it is not ok to login with an empty password:
     ($pwd =~ /^\s*$/) && ($utype = '');  
-
+    
     if ($utype ne '') {
       $session = new CGI::Session("driver:File",undef,{Directory=>$sessiond});
       $session->expire('+60m');
       $session->param('uid',$uid);
       $session->param('utype',$utype);
       $session->param('upassf',$upassf);
-      wlog($uid,'','login');
+      add_to_log($uid,'','login');
       home(1);
     }
     else {
@@ -72,8 +82,8 @@ if (!defined($sid)) {
 }
 else {
   $session = new CGI::Session("driver:File",$sid,{Directory=>$sessiond}) ||
-    abort_login($uid,"Erro ao recuperar a sessão ($!).");
-
+    abort_login('',"Erro ao recuperar a sessão: $!");
+  
   if (!$session->param('uid')) {
     $session->delete();
     login_form();
@@ -91,15 +101,15 @@ else {
     submit_assignment();
   }
   elsif ($action eq 'out') {
+    add_to_log($session->param('uid'),'','logout');
     $session->delete();
-    wlog($session->param('uid'),'','logout');
     login_form();
   }
   elsif ($action eq 'scr') {
-    show_scores_table();
+    show_grades_table();
   }
   elsif ($action eq 'asc') {
-    show_all_scores_table();
+    show_all_grades_table();
   }
   elsif ($action eq 'dwn') {
     download_file();
@@ -108,7 +118,7 @@ else {
     show_help(param('arg1').'.html');
   }
   elsif ($action eq 'moss') {
-    moss($session->param('uid'),param('arg1'));
+    invoke_moss($session->param('uid'),param('arg1'));
   }
   else {
     home(0);
@@ -119,98 +129,130 @@ exit(0);
 
 
 
-
-################################################################################
+####################################################################################################
 sub login_form {
 
   print header();
-  print start_html(-title=>'sqtpm', -style=>{-src=>['sqtpm.css'], -media=>'all'},
+  print start_html(-title=>'sqtpm', 
+		   -style=>{-src=>['sqtpm.css']},
 		   -head=>[Link({-rel=>'icon',-type=>'image/png',-href=>'./icon.png'})]);
 
-  print <<'  END';
-    <script src="sqtpm.js?61"></script>
-    <div class="f85">
-    <h1>sqtpm</h1>
-    <form method="post" action="sqtpm.cgi" enctype="multipart/form-data" name="sqtpm">
-    <table cellspacing="5" border="0">
-    <tr><td>usuário:</td><td>
-    <input onkeypress="enterh(event,'u')" type="text" name="uid" size="10" maxlength="20">
-    </td></tr>
-    <tr><td>senha:</td><td>
-    <input onkeypress="enterh(event,'p')" type="password" name="pwd" size="10" maxlength="20">
-    </td></tr>
-    </table>
-    <input type="hidden" name="action">
-    <input type="hidden" name="arg1">
-    <input type="hidden" name="arg2">
-    <input type="hidden" name="arg3">
-    <hr>
-    <a href="javascript:;" onclick="login()">entrar</a> &nbsp; &#8226; &nbsp; 
-    <a href="sqtpm-pwd.cgi">senhas</a> &nbsp; &#8226; &nbsp; 
-    <a href="javascript:;" onclick="about()">bula</a>
-    <noscript><p>Seu browser não tem javascript.  Boa sorte na próxima!</noscript>
-    </form>
-    <script type="text/javascript">document.sqtpm.uid.focus();</script>
-    </div>
-  END
+  print <<END;
+<script type="text/javascript" src="sqtpm.js?61"></script>
+<div class="f85">
+<h1>sqtpm</h1>
+<form method="post" action="sqtpm.cgi" enctype="multipart/form-data" name="sqtpm">
+<table cellspacing="5" border="0">
+<tr><td>usuário:</td><td>
+<input onkeypress="enterh(event,'u')" type="text" name="uid" size="10" maxlength="20">
+</td></tr>
+<tr><td>senha:</td><td>
+<input onkeypress="enterh(event,'p')" type="password" name="pwd" size="10" maxlength="20">
+</td></tr>
+</table>
+<input type="hidden" name="action">
+<input type="hidden" name="arg1">
+<input type="hidden" name="arg2">
+<input type="hidden" name="arg3">
+<hr>
+<a href="javascript:;" onclick="login()">entrar</a> &nbsp; &#8226; &nbsp; 
+<a href="sqtpm-pwd.cgi">senhas</a> &nbsp; &#8226; &nbsp; 
+<a href="javascript:;" onclick="about()">bula</a>
+<noscript><p>Seu browser não tem javascript.  Boa sorte na próxima!</noscript>
+</form>
+<script type="text/javascript">document.sqtpm.uid.focus();</script>
+</div>
+END
 
   print end_html();
 }
 
 
 
-
-################################################################################
+####################################################################################################
 sub home {
 
-  my ($DIR, $first_login, $group, $i, $j, $lang_tags, $scr, $tab,
-      $uid, $upassf, $utype, %cfg, %groups, %rep, @assign, @aux,
-      @group, @groups, @open, @open_langs);
+  my $first_login = shift;
 
-  $uid = $session->param('uid');
-  $utype = $session->param('utype');
-  $upassf = $session->param('upassf');
+  my $uid = $session->param('uid');
+  my $utype = $session->param('utype');
+  my $upassf = $session->param('upassf');
+  my $scr = $session->param('screen');
 
-  $first_login = shift;
-
-  $scr = $session->param('screen');
-
+  print_html_start($first_login,'envio',0);
+  
   if (!defined($scr)) {
     %sys_cfg = load_keys_values('sqtpm.cfg');
-
+    
     # Grab assignments for the user:
-    opendir($DIR,'.') || abort('','','home : opendir root : $!).');
-    @assign = sort(grep { -d $_ && !/^\./ && !/^\_/ && -e "$_/config" && -l "$_/$upassf" } 
-		   readdir($DIR));
+    opendir(my $DIR,'.') || abort('','','home: opendir root: $!');
+    my @assign = sort(grep {-d $_ && !/^\./ && -e "$_/config" && -l "$_/$upassf" && stat("$_/$upassf")} 
+		      readdir($DIR));
     close($DIR);
-
-    # Assignments table.  Table header:
-    $tab = '<b>Trabalhos:</b>';
-    $tab .= '<p></p><div class="f95"><table class="grid">';
-    $tab .= '<tr><th class="grid">Enunciado</th>';
-    ($utype eq 'P') && ($tab .= '<th class="grid">Abertura</th>');
-    $tab .= '<th class="grid">Data limite</th>';
-    $tab .= '<th class="grid">Estado</th>';
+    
+    # Assignments table header:
+    my $tab = '<b>Trabalhos:</b>';
+    $tab .= '<p></p><table class="grid"><tr> <th class="grid">Enunciado</th>';
     ($utype eq 'P') && ($tab .= '<th class="grid">Grupos</th>');
-    ($utype eq 'A') && ($tab .= '<th class="grid">Último envio</th></tr>');
+    $tab .= '<th class="grid">Estado</th>';
+    ($utype eq 'P') && ($tab .= '<th class="grid">Abertura</th>');    
+    $tab .= '<th class="grid">Data limite</th>';
+    ($utype eq 'S') && ($tab .= '<th class="grid">Último envio</th></tr>');
     ($utype eq 'P') && ($tab .= '<th class="grid">Moss</th></tr>');
     
-    @open = ();
-    @open_langs = ();
-    %groups = ();
-    
-    # Table rows:
-    for ($i=0; $i<@assign; $i++) {
-      %cfg = (%sys_cfg, load_keys_values("$assign[$i]/config"));
-      
-      # If this is not a prof and the assignment is still closed, skip it:
-      ($utype ne 'P') && (exists($cfg{startup}) && elapsed_days($cfg{startup}) < 0) && next;
+    my %groups = ();
+
+    # Assignments table rows:
+    for (my $i=0; $i<@assign; $i++) {
+      my %cfg = (%sys_cfg, load_keys_values("$assign[$i]/config"));
+
+      # If this is a student and the assignment is still closed, skip it:
+      ($utype eq 'S' && exists($cfg{startup}) && elapsed_days($cfg{startup}) < 0) && next;
       
       # Assignment tag:
       $tab .= '<tr align="center"><td class="grid">' .
 	"<a href=\"javascript:;\" onclick=\"wrap('stm','$assign[$i]');\">$assign[$i]</a></td>";
 
-      # Startup for profs:
+      opendir($DIR,$assign[$i]) || abort($uid,$assign[$i],"home: opendir $assign[$i]: $!");
+      my @group = sort(grep {/\.pass$/ && -l "$assign[$i]/$_" && stat("$assign[$i]/$_")} readdir($DIR));
+      close($DIR);
+      
+      # Groups:
+      if ($utype eq 'P') {
+	$tab .= "<td class=\"grid\">";
+	for (my $j=0; $j<@group; $j++) {
+	  my $group = $group[$j];
+	  $group =~ s/\.pass$//;
+	  $tab .= '<a href="javascript:;" ' . 
+	    "onclick=\"wrap('scr','$group','$assign[$i]');\">$group</a>&nbsp; ";
+	  $groups{$group} = 1;
+	}
+	$tab .= '</td>';
+      }
+
+      # State:
+      $tab .= "<td class=\"grid\">";
+      if (exists($cfg{startup}) && elapsed_days($cfg{startup}) < 0) {
+	$tab .= '<font color="Tomato">fechado</font>';
+      }
+      elsif (exists($cfg{deadline})) {
+	my $days = elapsed_days($cfg{deadline});
+	if ($days*$cfg{penalty} < 100) {
+	  $tab .= '<font color="MediumBlue">aberto</font>';
+	}
+	elsif ($days <= $cfg{'keep-open'}) {
+	  $tab .= '<font color="MediumBlue">encerrado</font>';
+	}
+	else {
+	  $tab .= 'encerrado';
+	}	  
+      }
+      else {
+	$tab .= '<font color="MediumBlue">aberto</font>'
+      }
+      $tab .= '</td>';
+
+      # Startup:
       if ($utype eq 'P') {
 	$tab .= "<td class=\"grid\">";
 	$tab .= (exists($cfg{startup}) ? dow($cfg{startup}) . " &nbsp;$cfg{startup}" : 'não há');
@@ -222,31 +264,13 @@ sub home {
       $tab .= exists($cfg{deadline}) ? dow($cfg{deadline}) . " &nbsp;$cfg{deadline}" : 'não há ';
       $tab .= '</td>';
 
-      # State:
-      $tab .= "<td class=\"grid\">";
-      if (exists($cfg{startup}) && elapsed_days($cfg{startup}) < 0) {
-	$tab .= 'fechado';
-      }
-      elsif (exists($cfg{deadline})) {
-	$tab .= (elapsed_days($cfg{deadline})*$cfg{penalty} < 100 ? 'aberto' : 'encerrado');
-      }
-      else {
-	$tab .= 'aberto';
-      }
-      $tab .= '</td>';
-
-      if ($utype ne 'P') {
-	if (!exists($cfg{deadline}) || elapsed_days($cfg{deadline})*$cfg{penalty} < 100) {
-	  push(@open,$assign[$i]);
-	  push(@open_langs,$cfg{languages});
-	}
-
-	# Current score:
-	%rep = get_rep_data("$assign[$i]/$uid/$uid.rep");
-      
-	if (exists($rep{score})) {
-	  $tab .= '<td class="grid"><a href="javascript:;"' . 
-	    "onclick=\"wrap('rep','$assign[$i]');\">$rep{score}</a>";
+      if ($utype eq 'S') {
+	# Last submisson grade:
+	my %rep = load_rep_data("$assign[$i]/$uid/$uid.rep");
+	
+	if (exists($rep{grade})) {
+	  $tab .= '<td class="grid"><a href="javascript:;" ' .
+	    "onclick=\"wrap('rep','$assign[$i]');\">$rep{grade}</a>";
 	}
 	else {
 	  $tab .= '<td class="grid">não houve';
@@ -254,263 +278,216 @@ sub home {
 	$tab .= '</td>';
       }
       else {
-	push(@open,$assign[$i]);
-	push(@open_langs,$cfg{languages});
-	
-	opendir($DIR,$assign[$i]) || abort($uid,$assign[$i],"home : opendir $assign[$i] : $!.");
-	@group = sort(grep {/\.pass$/ && -l "$assign[$i]/$_"} readdir($DIR));
-	close($DIR);
-	
-	# Groups:
-	$tab .= "<td class=\"grid\">";
-	for ($j=0; $j<@group; $j++) {
-	  $group = $group[$j];
-	  $group =~ s/\.pass$//;
-	  $tab .= "<a href=\"javascript:;\"" . 
-	    "onclick=\"wrap('scr','$group','$assign[$i]');\">$group</a>&nbsp; ";
-	  $groups{$group} = 1;
-	}
-	$tab .= '</td>';
-
 	# Moss launcher:
-	$tab .= "<td class=\"grid\"><a href=\"javascript:;\"" . 
-	  " onclick=\"wrap('moss','$assign[$i]');\">comparar</a></td>";
+	$tab .= '<td class="grid"><a href="javascript:;" ' . 
+	  "onclick=\"wrap('moss','$assign[$i]');\">comparar</a></td>";
       }
-   
-      $tab .= '</tr>';
-     }
+    }
+    $tab .= '</table>';
 
-    $tab .= '</table></div>';
-    
-    # Score table links for prof:
-    if ($utype eq 'P') {
-      #$tab .= '<div style="margin-top:20px"></div>';
-      $tab .= "<p><b>Tabelas de acertos:</b></p>";
-      $tab .= '<div class="f95">';
-      $tab .= "Por grupo: ";
-      
-      @groups = sort keys(%groups);
-      for ($j=0; $j<@groups; $j++) {
-	$tab .= "<a href=\"javascript:;\"" . 
-	  "onclick=\"wrap('asc','$groups[$j]');\">$groups[$j]</a>&nbsp; ";
-      }
-      $tab .= '</div>';
-    }
-    
-    # "No assignments" message or submission controls:
+    # If there are no assignments, drop tab:
     if (@assign == 0) {
-      $scr = "<p>Não há trabalhos para $uid.</p>";
+      $tab = "<p>Não há trabalhos para $uid.</p>";
     }
-    else {
+
+    # Links for grade tables:
+    my @groups = sort keys(%groups);
+    
+    if ($utype eq 'P' && @groups) {
+      $tab .= "<p><b>Tabelas de acertos:</b>";
+      $tab .= '<br>&nbsp;&nbsp;';
       
-      if (@open == 0) {
-	$scr .= $tab;
+      for (my $j=0; $j<@groups; $j++) {
+      	$tab .= '<a href="javascript:;" ' .
+	  "onclick=\"wrap('asc','$groups[$j]');\">$groups[$j]</a>&nbsp;";
       }
-      else {
-	# js to force page reload:                                                
-	$scr = '<script language=\"javascript\">' .                               
-	  'window.onpageshow = function(e) {' .                                   
-	  'if (e.persisted) { document.body.style.display = \"none\"; location.reload(); } };' .
-	  '</script>';                                                            
-	
-	$scr .= $tab;
-	
-	# The assignments and languagess are added as variables loaded dinamically by JS.  
-	# The assignment names, the language tags and the language labels go in
-	# arrays of strings.  Languages for each statement are separated by |:
-	$scr .= '<script type="text/javascript">';
-	$scr .= 'var assignments = new Array(';      
-	
-	for ($i=0; $i<@open-1; $i++) {
-	  $scr .= "\"$open[$i]\",";
-	}
-	$scr .= "\"$open[$#open]\");";
-	
-	$scr .= 'var language_tags = new Array();';
-	$scr .= 'var language_labels = new Array();';
-	$scr .= 'language_tags[0] = "";';
-	$scr .= 'language_labels[0] = "";';
-	
-	for ($i=0; $i<@open_langs; $i++) {
-	  @aux = split(/\s+/,$open_langs[$i]);
-	  
-	  $lang_tags = ''; 
-	  
-	  for ($j=0; $j<@aux-1; $j++) {
-	    $lang_tags .= "$aux[$j]|";
-	  }
-	  $lang_tags .= "$aux[$j]";
-	  
-	  $j = $i+1;
-	  $scr .= "language_tags[$j] = \"$lang_tags\";";
-	  $scr .= "language_labels[$j] = \"$lang_tags\";";
-	}
-	
-	$scr .= '</script>' .
-	  #'<div style="margin-top:20px"></div>' .
-	  '<p><b>Enviar:</b></p>' .
-	  '<div class="f95">' .
-	  '<table cellspacing="1" border="0">' .
-	  '<tr><td>Trabalho:</td><td><select name="submassign" id="submassign" ' .
-	  '  onchange="javascript:fill_langs(\'submassign\',\'language\')"></select></td></tr>' .
-	  '<tr><td>Linguagem:</td><td><select name="language" id="language"></select></td></tr>' .
-	  '<tr><td>Arquivos:</td><td>' .
-	  '  <input type="file" name="source" multiple size="30" maxlength="80"></td></tr>' .
-	  '<tr><td>&nbsp;</td><td>&nbsp;</td></tr>' .
-	  '<tr><td><input type="submit" class="button" name="subm" value="Enviar" ' .
-	  '  onclick="javascript:wrap(\'sub\')"></td><td></td></tr>'.
-	  '</table>' .
-	  '<script>fill_assigns("submassign","language");</script>' .
-	  '</div>';
-      }
+      $tab .= '';#'</p>';
     }
+
+    $scr .= $tab;
     $session->param('screen',$scr);
   }
 
-  print_start_html($first_login,'envio',0);
   print $scr;
-  print_end_html();
+  print_html_end();
 }
 
 
 
-
-################################################################################
+####################################################################################################
 sub show_subm_report {
 
-  my ($FILE, $assign, $reportf, $uid, $upassf, $user, $userd, $utype, @files);
+  my $uid = $session->param('uid');
+  my $utype = $session->param('utype');
+  my $upassf = $session->param('upassf');
 
-  $uid = $session->param('uid');
-  $utype = $session->param('utype');
-  $upassf = $session->param('upassf');
+  my $assign = param('arg1');
+  my $user = param('arg2');
 
-  $assign = param('arg1');
-  $user = param('arg2');
-
+  print_html_start(0,'saida',0);
+  
   check_assign_access($uid,$upassf,$assign);
 
   ($utype eq 'P' && $user ne 'undefined') && ($uid = $user);
 
-  $userd = "$assign/$uid";
-  $reportf = "$userd/$uid.rep";
+  my $userd = "$assign/$uid";
+  my $reportf = "$userd/$uid.rep";
 
-  (!-e $reportf) && block_user($uid,$upassf,"Não existe arquivo $reportf, bloqueado.");
+  (!-e $reportf) && 
+    block_user($uid,$upassf,"show_report: não existe arquivo $reportf.");
 
   # Print report:
-  print_start_html(0,'saida',0);
-
-  open($FILE,'<',$reportf) || abort($uid,$assign,"show_subm_report : open $reportf : $!");
+  open(my $FILE,'<',$reportf) || abort($uid,$assign,"show_subm_report: open $reportf: $!");
   while (<$FILE>) {
     print $_;
   }
   close($FILE);
 
-  print_end_html();
+  print_html_end();
 }
 
 
 
-
-################################################################################
+####################################################################################################
 sub show_statement {
 
-  my ($DIR, $assign, $i, $group, $uid, $upassf, $utype, %cfg, @aux);
+  my $uid = $session->param('uid');
+  my $utype = $session->param('utype');
+  my $upassf = $session->param('upassf');
+  my $assign = param('arg1');
 
-  $uid = $session->param('uid');
-  $utype = $session->param('utype');
-  $upassf = $session->param('upassf');
-  $assign = param('arg1');
+  print_html_start();
 
   check_assign_access($uid,$upassf,$assign);
 
-  print_start_html();
-
   (!%sys_cfg) && (%sys_cfg = load_keys_values('sqtpm.cfg'));
-  %cfg = (%sys_cfg, load_keys_values("$assign/config"));
+  my %cfg = (%sys_cfg, load_keys_values("$assign/config"));
 
-  # If the assignment is not open yet for students, this is strange:
+  # If the assignment is not open yet and the user is a student, this is strange:
   ($utype ne 'P' && exists($cfg{startup}) && elapsed_days($cfg{startup}) < 0) && 
-    block_user($uid,$upassf,"O prazo para enviar $assign não começou, bloqueado.");
+    block_user($uid,$upassf,"show_st: o prazo para enviar $assign não começou.");
 
-  print "<b>Trabalho:</b> $assign";
-  print '<table><tr><td style="vertical-align:top">';
-  print "Linguagens: $cfg{languages}";
+  print "<b>Trabalho:</b> $assign" .
+    '<table><tr><td style="vertical-align:top">' .
+    "Linguagens: $cfg{languages}";
 
-  # Pascal and Fortran are limited to a sigle source file:
-  ($cfg{languages} eq 'Pascal' || $cfg{languages} eq 'Fortran') && ($cfg{sources} = '1,1');
+  # Pascal, Fortran and Python3 are limited to a sigle source file:
+  ($cfg{languages} eq 'Pascal' || $cfg{languages} eq 'Fortran' || $cfg{languages} eq 'Python3') && ($cfg{sources} = '1,1');
 
   if (exists($cfg{sources})) {
-    @aux = split(/,/,$cfg{sources});
+    my @aux = split(/,/,$cfg{sources});
     print "<br>Arquivos-fonte a enviar: " . 
-      ($aux[0] == $aux[1] ? "$aux[0]." : "entre $aux[0] e $aux[1].");
+      ($aux[0] == $aux[1] ? "$aux[0]" : "entre $aux[0] e $aux[1]");
   }
 
   if (exists($cfg{pdfs})) {
-    @aux = split(/,/,$cfg{pdfs});
+    my @aux = split(/,/,$cfg{pdfs});
     print "<br>Arquivos pdf a enviar: " . 
-      ($aux[0] == $aux[1] ? "$aux[0]." : "entre $aux[0] e $aux[1].");
+      ($aux[0] == $aux[1] ? "$aux[0]" : "entre $aux[0] e $aux[1]");
   }
 
   if (exists($cfg{filenames})) {
-    @aux = split(/ +/,$cfg{filenames});
-    for ($i=0; $i<@aux; $i++) {
+    my @aux = split(/ +/,$cfg{filenames});
+    for (my $i=0; $i<@aux; $i++) {
       $aux[$i] =~ s/\{uid\}/$uid/;
       $aux[$i] =~ s/\{assign\}/$assign/;
     }
     print "<br>Envie arquivos com nomes: @aux.";
   }
 
-  exists($cfg{startup}) && print "<br>Data de abertura: $cfg{startup}";
+  (exists($cfg{startup})) && print "<br>Data de abertura: $cfg{startup}";
+
+  my $days = 0;
 
   if (exists($cfg{deadline})) {
+    $days = elapsed_days($cfg{deadline}); 
     print "<br>Data limite para envio: $cfg{deadline}";
-    (elapsed_days($cfg{deadline})*$cfg{penalty} >= 100) && print ' (encerrado)';
-    ($cfg{penalty} < 100) && print "<br>Multa por dia de atraso: $cfg{penalty}\%";
+    ($days*$cfg{penalty} >= 100) && print ' (encerrado)';
+    ($cfg{penalty} < 100) && print "<br>Penalidade por dia de atraso: $cfg{penalty}\%";
+  }
+  
+  my $open = 0;
+  if ($utype eq 'S' && exists($cfg{deadline})) {
+    if ($days*$cfg{penalty} < 100 || ($days*$cfg{penalty} >= 100 && $days <= $cfg{'keep-open'})) {
+      $open = 1;
+    }
+  }
+  else {
+    $open = 1;
   }
 
-  print "<br>Número máximo de envios: $cfg{tries}";
+  if ($open) {
+    print "<br>Número máximo de envios: $cfg{tries}";
 
-  if (-f "$assign/casos-de-teste.tgz") {
-    print "<br>Casos-de-teste abertos: <a href=\"javascript:;\" " .
-      "onclick=\"wrap('dwn','$assign','','casos-de-teste.tgz')\";>casos-de-teste.tgz</a><br>";
+    if (-f "$assign/casos-de-teste.tgz") {
+      print '<br>Casos-de-teste abertos: <a href="javascript:;" ' .
+	"onclick=\"wrap('dwn','$assign','','casos-de-teste.tgz')\";>casos-de-teste.tgz</a>";
+    }
   }
-
+  
+  if ($utype eq 'S') {
+    my %rep = load_rep_data("$assign/$uid/$uid.rep");
+    if (exists($rep{grade})) {
+      print "<p><b>Último envio:</b> " .
+	"<a href=\"javascript:;\" onclick=\"wrap('rep','$assign');\">$rep{grade}</a> em $rep{at}" .
+	"<br>Envios: $rep{tries}"; 
+    }
+  }
+  
+  print "</td>";
+  
   if ($utype eq 'P') {
-    print '</td><td>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td><td style="vertical-align:top">';
-    print "Backup: $cfg{backup} <br>";
-    print 'Pontuação: ', $cfg{scoring}, '<br>';
-    print "cputime: $cfg{cputime} s<br>";
-    print "virtmem: $cfg{virtmem} kb<br>";
-    print "stkmem: $cfg{stkmem} kb<br>";
-    %langs = map { $_ => 1 } split(/ +/,$cfg{languages});
-    (exists($langs{C}) && exists($cfg{'gcc-args'})) && (print "gcc-args: $cfg{'gcc-args'}<br>");
-    print '</td>';
+    print '<td>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td>' .
+      '<td style="vertical-align:top">' .
+      "backup: $cfg{backup}<br>grading: $cfg{grading}<br>keep-open: $cfg{'keep-open'}</td>" ,      
+      '<td>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</td>' . 
+      '<td style="vertical-align:top">' .
+      "cputime: $cfg{cputime} s<br>virtmem: $cfg{virtmem} kb<br>stkmem: $cfg{stkmem} kb</td>";
   }
-  print '</tr>';
-  print '</table>';
+  print '</tr></table>';
+
 
   # Groups:
   if ($utype eq 'P') {
-    opendir($DIR,$assign) || abort($uid,$assign,"home : opendir $assign : $!.");
-    @aux = sort(grep {/\.pass$/ && -l "$assign/$_"} readdir($DIR));
+    opendir(my $DIR,$assign) || abort($uid,$assign,"home: opendir $assign: $!");
+    my @aux = sort(grep {/\.pass$/ && -l "$assign/$_" && stat("$assign/$_")} readdir($DIR));
     close($DIR);
-
-    print "Grupos:&nbsp;";
-    for ($i=0; $i<@aux; $i++) {
-      $group = $aux[$i];
+    
+    print '<p><b>Grupos:</b><br>&nbsp;';
+    for (my $i=0; $i<@aux; $i++) {
+      my $group = $aux[$i];
       $group =~ s/\.pass$//;
-      print "<a href=\"javascript:;\"" .
+      print '<a href="javascript:;"' .
 	"onclick=\"wrap('scr','$group','$assign');\">$group</a>&nbsp; ";
     }
   }
 
+  if ($open) {
+    my @aux = split(/ +/,$cfg{languages});
+
+    print "<input type=\"hidden\" name=\"submassign\" value=\"$assign\">" .
+      '<p><b>Enviar:</b></p>' .
+      '<div class="f95">' .
+      '<table cellspacing="0" border="0">' .
+      '<tr> <td>Linguagem:&nbsp;&nbsp;';   
+    
+    print $cgi->popup_menu('language', \@aux);
+    
+    print '</td><td>&nbsp;&nbsp;&nbsp;&nbsp;</td><td>Arquivos:&nbsp;&nbsp;' .
+      '<input type="file" name="source" multiple></td>' .
+      '<td><input type="submit" class="button" name="subm" value="Enviar"' .
+      ' onclick="javascript:wrap(\'sub\')"></td>'.
+      '</table>' .
+      '</div><p>';
+  }
+
   if (exists($cfg{description})) {
     if ($cfg{description} =~ /^http/) {
-      print "<p>Enunciado: <a href=\"$cfg{description}\">$cfg{description}</a>";
+      print "<p><hr>Enunciado: <a href=\"$cfg{description}\">$cfg{description}</a><hr>";
     }
     elsif (-f "$assign/$cfg{description}") {
-      print '<hr>';
-      print_html($assign,$cfg{description});
+      print '<p><hr>';
+      print_html_file($assign,$cfg{description});
       print '<hr>';
     }
     else {
@@ -521,53 +498,49 @@ sub show_statement {
     print "<p>Não há enunciado para $assign.";
   }
 
-  print_end_html();
+  print_html_end();
 }
 
 
 
-
-################################################################################
+####################################################################################################
 sub show_about {
 
   print header();
-  print start_html(-title=>'sqtpm', -style=>{-src=>['sqtpm.css'], -media=>'all'},
+  print start_html(-title=>'sqtpm', 
+		   -style=>{-src=>['sqtpm.css']},
 		   -head=>[Link({-rel=>'icon',-type=>'image/png',-href=>'icon.png'})]);
 
   print '<div class="f85">';
-  print_html('','bula.html');
+  print_html_file('','bula.html');
   print '<hr><a href="sqtpm.cgi">sqtpm</a></div>';
   print end_html();
 }  
 
 
 
-
-################################################################################
+####################################################################################################
 sub show_help {
 
   my $file = shift;
 
-  print_start_html();
-  print_html('',$file);
-  print_end_html();
+  print_html_start();
+  print_html_file('',$file);
+  print_html_end();
 }  
 
 
 
-
-################################################################################
+####################################################################################################
 sub download_file {
 
-  my ($FILE, $assign, $file, $uid, $suid, $upassf, $utype);
+  my $uid = $session->param('uid');
+  my $utype = $session->param('utype');
+  my $upassf = $session->param('upassf');
 
-  $assign = param('arg1');
-  $suid = param('arg2');
-  $file = param('arg3');
-
-  $uid = $session->param('uid');
-  $utype = $session->param('utype');
-  $upassf = $session->param('upassf');
+  my $assign = param('arg1');
+  my $suid = param('arg2');
+  my $file = param('arg3');
 
   # Check user access rights to assignment:
   check_assign_access($uid,$upassf,$assign);
@@ -577,10 +550,10 @@ sub download_file {
     $file = "$assign/$file";
   }
   else {
-    if ($utype eq 'A') {
+    if ($utype eq 'S') {
       $file = "$assign/$uid/$file";
       if (!-f $file) {
-	#block_user($uid,$upassf,"O arquivo $file não existe, bloqueado.");
+	block_user($uid,$upassf,"download_file: $assign/$uid/$file não existe.");
       }
     }
     elsif ($utype eq 'P') {
@@ -591,7 +564,7 @@ sub download_file {
   # Download:
   print "Content-Type:application/x-download\nContent-Disposition:attachment;filename=$file\n\n";
   
-  open($FILE,'<',$file) || abort($uid,$assign,"download_file : open $file : $!");
+  open(my $FILE,'<',$file) || abort($uid,$assign,"download_file: open $file: $!");
   binmode $FILE;
   while (<$FILE>) {
     print $_;
@@ -601,325 +574,372 @@ sub download_file {
 
 
 
+####################################################################################################
+sub show_grades_table {
 
-################################################################################
-sub show_scores_table {
+  my $uid = $session->param('uid');
+  my $utype = $session->param('utype');
+  my $upassf = $session->param('upassf');
 
-  my ($assign, $curr, $d, $date, $first, $i, $k, $last, $m, $n,
-      $passf, $show, $show100, $size, $uid, $upassf, $user,
-      $utype, $y, %cfg, %freq, %freq100, %langs, %rep, %scores, @aux,
-      @f, @langs, @users);
+  my $passf = param('arg1').'.pass';
+  my $assign = param('arg2');
 
-  $uid = $session->param('uid');
-  $utype = $session->param('utype');
-  $upassf = $session->param('upassf');
-
-  $passf = param('arg1').'.pass';
-  $assign = param('arg2');
+  print_html_start();
 
   check_assign_access($uid,$upassf,$assign);
-  
-  print_start_html();
-  print "<p><b>Acertos para $passf em $assign:</b>";
 
-  # Get users:
-  @users = sort keys %{{load_keys_values($passf,':')}};
-  if (@users == 0) {
-    print '<p>Nenhum usuário em $passf.</p>';
-    print_end_html();
-    return;
+  my $tabfile = "$assign/grades.$passf";
+  $tabfile =~ s/\.pass$//;
+
+  my $tab;
+
+  # If the table exists already, load it from file.
+  if (-f $tabfile) {
+    open(my $F,'<',$tabfile) || abort($uid,$assign,"show_grades_table: open $tabfile: $!");
+    {
+      local $/;
+      $tab = <$F>;
+    }
+    close($F);
   }
+  else {
+    $tab = "<p><b>Acertos para $passf em $assign:</b>";
 
-  (!%sys_cfg) && (%sys_cfg = load_keys_values('sqtpm.cfg'));
-
-  # Get users scores and build a hash having an array of student ids for each language:
-  %scores = ();
-  %langs = ();
-
-  for ($i=0; $i<@users; $i++) {
-    $users[$i] =~ s/^[\*@]?//;
-  }    
-
-  foreach $user (@users) {
-    %rep = get_rep_data("$assign/$user/$user.rep");
-
-    if (exists($rep{score})) { 
-      $scores{$user} = '<a href="javascript:;"' . 
-	"onclick=\"wrap('rep','$assign','$user');\">$rep{score}</a>";
-
-      (!exists($langs{$rep{lang}})) && ($langs{$rep{lang}} = ());
-      push(@{$langs{$rep{lang}}},$user);
+    my @langs;
+    my %langs;
+    my %grades;
+    
+    # Get users:
+    my @users = load_keys($passf,':');
+    if (@users == 0) {
+      $tab .= '<p>Nenhum usuário em $passf.</p>';
     }
     else {
-      $scores{$user} = '-';
-    }
-  }
+      (!%sys_cfg) && (%sys_cfg = load_keys_values('sqtpm.cfg'));
+      my %cfg = (%sys_cfg, load_keys_values("$assign/config"));
 
-  @langs = keys(%langs);
+      # Get users grades and build a hash having an array of student ids for each language:
+      %grades = ();
+      %langs = ();
 
-  # Produce a report with a table with tuples {user,score}  
+      for (my $i=0; $i<@users; $i++) {
+	$users[$i] =~ s/^[\*@]?//;
+      }    
 
-  $show = 0;
-  $show100 = 0;
-  $rows = '';
-  
-  foreach $user (@users) {
-    $rows .= "<tr align=center>" . 
-      "<td class=\"grid\"><b>$user</b></td><td class=\"grid\">$scores{$user}</td></tr>";
-    ($scores{$user} ne '-') && ($show++);
-    ($scores{$user} =~ '>100%</a>$') && ($show100++);
-  }
+      foreach my $user (@users) {
+	my %rep = load_rep_data("$assign/$user/$user.rep");
 
-  $n = @users;
+	if (exists($rep{grade})) {
 
-  print '<div class="f95" style="overflow-x:scroll">'.
-    '<table border=0><tr><td valign=\'top\'>' .
-    '<table class="grid">';
- 
-  print '<tr align=center>' . 
-    "<td class=\"grid\"><b>Total</b></td><td class=\"grid\" colspan=0>$n</td></tr>" .
-    '<tr align=center><td class="grid"><b>Submetidos</b></td>';
-  printf("<td class=\"grid\">%i (%.0f%%)</td></tr>",$show,$n>0 ? 100*$show/$n : 0);
-  print '<tr align=center><td class="grid"><b>100</b></td>';
-  printf("<td class=\"grid\">%i (%.0f%%)</td></tr>",$show100,$show>0 ? 100*$show100/$show : 0);
-  print "<tr><th class=\"grid\">Usuário</th><th class=\"grid\">$assign</th></tr>";
-  
-  print $rows;
-  
-  print '</table>';
+	  my $g = $rep{grade};
+	  $g =~ s/\%//;
+	  
+	  $grades{$user} = '<a href="javascript:;"' . 
+	    "onclick=\"wrap('rep','$assign','$user');\">$g</a>";
 
-
-  @langs == 1 && print "<p>Todos em $langs[0].";
-
-  print '</td><td valign=\'top\'>';
-
-  # Submission histogram per day:
-  %users = map { $_ => 1 } @users; # used by wanted_hist
-  @grades = ();                    # modified by wanted_hist, holds the grades.    
-  find(\&wanted_hist,"$assign");
-
-  if (@grades) {
-
-   %freq = ();
-   %freq100 = ();
-
-    for ($i=0; $i<@grades; $i+=2) {
-      if (exists($freq{"$grades[$i]"})) {
-	$freq{"$grades[$i]"}++;
-      }
-      else {
-	$freq{"$grades[$i]"} = 1;
-	$freq100{"$grades[$i]"} = 0;
+	  (!exists($langs{$rep{lang}})) && ($langs{$rep{lang}} = ());
+	  push(@{$langs{$rep{lang}}},$user);
+	}
+	else {
+	  $grades{$user} = '-';
+	}
       }
 
-      if ($grades[$i+1] eq '100%') {
-	$freq100{"$grades[$i]"}++;
-      }
-    }
-    
-    @f = sort { $a cmp $b } keys(%freq);
-    $first = $f[0];
-    $last = $f[$#f];
-    
-    %cfg = (%sys_cfg, load_keys_values("$assign/config"));
-    
-    if (exists($cfg{startup})) {
-      $cfg{startup} =~ /(.*) .*/;
-      $first gt $1 && ($first = $1);
-    }
-
-    if (exists($cfg{deadline})) {
-      $cfg{deadline} =~ /(.*) .*/;
-      $last lt $1 && ($last = $1);
-      $last =~ s/-/\//g;
-    }
-
-    ($y, $m, $d) = split(/\//,$first);
-    $first = timelocal(0, 0, 12, $d, $m - 1, $y - 1900);
-    ($y, $m, $d) = split(/\//,$last);
-    $last = timelocal(0, 0, 12, $d, $m - 1, $y - 1900);
-    
-    $curr = $first;
-    while ($curr le $last) {
+      # Produce a report with a table with tuples {user,grade} and a
+      # histogram.  They are both in an outer table.
+      my $show = 0;
+      my $show100 = 0;
+      my $rows = '';
       
-      @aux = localtime($curr);
-      $date = sprintf("%04.0f/%02.0f/%02.0f",$aux[5]+1900,$aux[4]+1,$aux[3]);
-      
-      if (!exists($freq{$date})) {
-	$freq{$date} = 0;
-	$freq100{$date} = 0;
+      foreach my $user (@users) {
+	$rows .= "<tr align=center>" . 
+	  "<td class=\"grid\"><b>$user</b></td><td class=\"grid\">$grades{$user}</td></tr>";
+	($grades{$user} ne '-') && ($show++);
+	($grades{$user} =~ '>100</a>$') && ($show100++);
       }
-      $curr += 24 * 60 * 60;
-    }
 
-    $size = keys %freq;
-    histogram("$assign/histogram.png",$size<30?600:$size*25,360,\%freq,\%freq100);
-    print "<img src=\"$assign/histogram.png\" style=\"border:0;padding: 0px 0px 0px 20px\">";
-    print '</td></tr></table></div>';
-  }
+      my $n = @users;
 
-  if (@langs > 1) {
-    # Produce a report with a table with tuples {user,score} for each language:  
-    print "<p>&nbsp;</p><b>Acertos para $passf em $assign por linguagem:</b>";
-    print '<table border=0><tr>';
+      $tab .= '<div class="f95" style="overflow-x:scroll">'.
+	'<table border=0><tr><td valign=\'top\'>' .
+	'<table class="grid">' .
+	'<tr align=center>' . 
+	"<td class=\"grid\"><b>Total</b></td><td class=\"grid\" colspan=0>$n</td></tr>" .
+	'<tr align=center><td class="grid"><b>Submetidos</b></td>' .
+	sprintf("<td class=\"grid\">%i (%.0f%%)</td></tr>",$show,$n>0?100*$show/$n:0) .
+	'<tr align=center><td class="grid"><b>100</b></td>' .
+	sprintf("<td class=\"grid\">%i (%.0f%%)</td></tr>",$show100,$show>0?100*$show100/$show:0) .
+	"<tr><th class=\"grid\">Usuário</th><th class=\"grid\">$assign</th></tr>" .
+	$rows .
+	'</table>';
 
-    for $k (@langs) {
-      print "<td valign='top'><b>$k:</b>" .
-	'<div class="f95"><table class="grid">' . 
-	"<tr><th class=\"grid\">Usuário</th><th class=\"grid\">$assign</th></tr>";
+      @langs = keys(%langs);
+      (@langs == 1) && ($tab .= "<p>Todos em $langs[0].");
+      $tab .= '</td>';
 
-      $show = 0;
-      $show100 = 0;
-      @users = @{$langs{$k}};
+      # Submission histogram per day:
+      if ($cfg{backup} eq 'on') {
+	%gusers = map { $_ => 1 } @users; # %gusers is used by wanted_hist
+	@ggrades = ();                    # @ggrades is modified by wanted_hist, it holds the grades.    
 
-      foreach $user (@users) {
-	print '<tr align=center>' . 
-	  "<td class=\"grid\"><b>$user</b></td><td class=\"grid\">$scores{$user}</td></tr>";
+	find(\&wanted_hist,"$assign");
 	
-	($scores{$user} ne '-') && ($show++);
-	($scores{$user} =~ '>100%</a>$') && ($show100++);
+	if (@ggrades) {
+	  my %freq = ();
+	  my %freq100 = ();
+	  my %frequniq = ();
+	  my %freq100uniq = ();
+
+	  my %uniq = ();
+	  my %uniq100 = ();
+	  
+	  for (my $i=0; $i<@ggrades; $i+=3) {
+	    if (exists($freq{"$ggrades[$i]"})) {
+	      $freq{"$ggrades[$i]"}++;
+	    }
+	    else {
+	      $freq{"$ggrades[$i]"} = 1;
+	      $freq100{"$ggrades[$i]"} = 0;
+	      $frequniq{"$ggrades[$i]"} = 0;
+	      $freq100uniq{"$ggrades[$i]"} = 0;
+	    }
+	    
+	    if ($ggrades[$i+1] eq '100%') {
+	      $freq100{"$ggrades[$i]"}++;
+	    }
+
+	    if (!exists($uniq{"$ggrades[$i]$ggrades[$i+2]"}) && $ggrades[$i+1] ne '100%') {
+	      $frequniq{"$ggrades[$i]"}++;
+	      $uniq{"$ggrades[$i]$ggrades[$i+2]"} = 1;
+	    }
+
+	    if (!exists($uniq100{"$ggrades[$i]$ggrades[$i+2]"}) && $ggrades[$i+1] eq '100%') {
+	      $freq100uniq{"$ggrades[$i]"}++;
+	      $uniq100{"$ggrades[$i]$ggrades[$i+2]"} = 1;
+	    }
+	  }
+	  
+	  my @aux = sort { $a cmp $b } keys(%freq);
+	  my $first = $aux[0];
+	  my $last = $aux[$#aux];
+	  
+	  if (exists($cfg{startup})) {
+	    $cfg{startup} =~ /(.*) .*/;
+	    ($first gt $1) && ($first = $1);
+	  }
+	  
+	  if (exists($cfg{deadline})) {
+	    $cfg{deadline} =~ /(.*) .*/;
+	    ($last lt $1) && ($last = $1);
+	    $last =~ s/-/\//g;
+	  }
+	  
+	  my ($y, $m, $d) = split(/\//,$first);
+	  $first = timelocal(0, 0, 12, $d, $m - 1, $y - 1900);
+	  ($y, $m, $d) = split(/\//,$last);
+	  $last = timelocal(0, 0, 12, $d, $m - 1, $y - 1900);
+	  
+	  my $curr = $first;
+	  while ($curr le $last) {
+	    my @aux = localtime($curr);
+	    my $date = sprintf("%04.0f/%02.0f/%02.0f",$aux[5]+1900,$aux[4]+1,$aux[3]);
+	    
+	    if (!exists($freq{$date})) {
+	      $freq{$date} = 0;
+	      $freq100{$date} = 0;
+	      $frequniq{$date} = 0;
+	      $freq100uniq{$date} = 0;
+	    }
+	    else {
+	      if ($freq{$date} < $freq100{$date}) {
+		$freq{$date} = $freq100{$date};
+	      }
+	      if ($frequniq{$date} < $freq100uniq{$date}) {
+		$frequniq{$date} = $freq100uniq{$date};
+	      }
+	    }
+	    
+	    $curr += 24 * 60 * 60;
+	  }
+	  
+	  my $size = keys %freq;
+	  
+	  $tab .= '<td valign=\'top\'>' .
+	    '<img src="data:image/png;base64,' .
+	    encode_base64(histogram($size<30 ? 600 : $size*25,360,\%freq,\%freq100)) .
+	    '" style="border:0;padding: 0px 0px 0px 20px">' .
+	    '';
+
+	  $tab .= '<img src="data:image/png;base64,' .
+	    encode_base64(histogram($size<30 ? 600 : $size*25,360,\%frequniq,\%freq100uniq)) .
+	    '" style="border:0;padding: 0px 0px 0px 20px">' .
+	    '</td>';
+	}
       }
-      
-      $n = @users;
-      print "<tr align=center><td class=\"grid\"><b>Total</b></td><td class=\"grid\">$n</td></tr>";
-      print '<tr align=center><td class="grid"><b>Submetidos</b><br><b>%</b></td>';
-      printf("<td class=\"grid\">%i<br>%.0f</td></tr>",$show,$n>0 ? 100*$show/$n : 0);
-      print '<tr align=center><td class="grid"><b>100</b><br><b>%</b></td>';
-      printf("<td class=\"grid\">%i<br>%.0f</td></tr>",$show100,$show>0 ? 100*$show100/$show : 0);
-      print '</table></div>';
-      print '</td><td></td>';
+      $tab .= '</tr></table></div>';
     }
+
+    if (@langs > 1) {
+      # Produce a report with a table with tuples {user,grade} for each language:  
+      $tab .= "<p>&nbsp;</p><b>Acertos para $passf em $assign por linguagem:</b>" .
+	'<table border=0><tr>';
+
+      for my $k (@langs) {
+	$tab .= "<td valign='top'><b>$k:</b>" .
+	  '<div class="f95"><table class="grid">' . 
+	  "<tr><th class=\"grid\">Usuário</th><th class=\"grid\">$assign</th></tr>";
+
+	my $show = 0;
+	my $show100 = 0;
+	@users = @{$langs{$k}};
+	
+	foreach my $user (@users) {
+	  $tab .= '<tr align=center>' . 
+	    "<td class=\"grid\"><b>$user</b></td><td class=\"grid\">$grades{$user}</td></tr>";
+	  
+	  ($grades{$user} ne '-') && ($show++);
+	  ($grades{$user} =~ '>100%</a>$') && ($show100++);
+	}
+	
+	my $n = @users;
+	$tab .= "<tr align=center><td class=\"grid\"><b>Total</b></td><td class=\"grid\">$n</td></tr>" .
+	  '<tr align=center><td class="grid"><b>Submetidos</b><br><b>%</b></td>' .
+	  sprintf("<td class=\"grid\">%i<br>%.0f</td></tr>",$show,$n>0?100*$show/$n:0) .
+	  '<tr align=center><td class="grid"><b>100</b><br><b>%</b></td>' .
+	  sprintf("<td class=\"grid\">%i<br>%.0f</td></tr>",$show100,$show>0?100*$show100/$show:0) .
+	  '</table></div>' .
+	  '</td><td></td>';
+      }
+    }
+
+    # Save table to file. submit_assignment() will remove it:
+    open(my $F,'>',$tabfile) || abort($uid,$assign,"show_grades_table: open $tabfile: $!");
+    print $F $tab;
+    close($F);    
   }
 
-  print_end_html();
+  print $tab;
+  print_html_end();
 }
 
 
 
+####################################################################################################
+sub show_all_grades_table {
 
-################################################################################
-sub show_all_scores_table {
+  my $uid = $session->param('uid');
+  my $utype = $session->param('utype');
+  my $upassf = $session->param('upassf');
 
-  my ($DIR, $amnt, $i, $n, $passf, $uid, $upassf, $user,
-      $usersuf, $utype, %rep, %scores, %show, %show100, @amnts, @users);
+  my $passf = param('arg1').'.pass';
 
-  $uid = $session->param('uid');
-  $utype = $session->param('utype');
-  $upassf = $session->param('upassf');
-
-  $passf = param('arg1').'.pass';
-
-  ($utype ne 'P') && block_user($uid,$upassf,"$uid não é prof, bloqueado.");
-
-  print_start_html();
+  print_html_start();
   
+  ($utype ne 'P') && block_user($uid,$upassf,"show_all: $uid é estudante.");
+
   # Get a list of assignments for the user:
-  opendir($DIR,'.') || abort($uid,'','all_scores : opendir root : $!).');
-  @amnts = sort(grep { -d $_ && !/^\./ && -f "$_/config" && -l "$_/$passf" } readdir($DIR));
+  opendir(my $DIR,'.') || abort($uid,'','all_grades: opendir root: $!');
+  my @amnts = sort(grep { -d $_ && !/^\./ && -f "$_/config" && -l "$_/$upassf" } readdir($DIR));
   close($DIR);
   
   if (@amnts == 0) {
     print "Não há trabalhos para $passf.";
-    print_end_html();
+    print_html_end();
   }
 
   print "<p><b>Acertos para $passf:</b></p>";
 
   # Get users:
-  @users = sort keys %{{load_keys_values($passf,':')}};
+  my @users = load_keys($passf,':');
 
-  for ($i=0; $i<@users; $i++) {
+  for (my $i=0; $i<@users; $i++) {
     $users[$i] =~ s/^[\*@]?//;
   }    
 
-  # Build the structure: $scores{assignment}{id} = score.
-  %scores = ();
+  # Build the structure: $grades{assignment}{id} = grade.
+  my %grades = ();
 
-  for ($i=@amnts-1; $i>=0; $i--) {
-    $scores{$amnts[$i]} = { () };
+  for (my $i=@amnts-1; $i>=0; $i--) {
+    $grades{$amnts[$i]} = { () };
 
-    foreach $user (@users) {
-      %rep = get_rep_data("$amnts[$i]/$user/$user.rep");
+    foreach my $user (@users) {
+      my %rep = load_rep_data("$amnts[$i]/$user/$user.rep");
 
       if ($rep{tries} > 0) {
-	$rep{score} =~ s/%//;
-	$rep{score} =~ s/recebido/r/;
-	$scores{$amnts[$i]}{$user} = '<a href="javascript:;"' . 
-	  "onclick=\"wrap('rep','$amnts[$i]','$user');\">$rep{score}</a>";
+	$rep{grade} =~ s/%//;
+	$rep{grade} =~ s/recebido/r/;
+	$grades{$amnts[$i]}{$user} = '<a href="javascript:;"' . 
+	  "onclick=\"wrap('rep','$amnts[$i]','$user');\">$rep{grade}</a>";
       }
       else {
-	$scores{$amnts[$i]}{$user} = '-';
+	$grades{$amnts[$i]}{$user} = '-';
       }
     }
   }
 
-  # Print a report with a table with tuples {user,score,score,...} and summaries:
+  # Print a report with a table with tuples {user,grade,grade,...} and summaries:
   print '<div style="overflow-x:scroll"><div class="f95">' .
     '<table class="grid"><tr><th class="grid">Usuário</th>';
 
-  %show = ();
-  %show100 = ();
+  my %show = ();
+  my %show100 = ();
 
-  foreach $amnt (@amnts) {
+  foreach my $amnt (@amnts) {
     print "<th class=\"grid\">$amnt";
     $show{$amnt} = 0;
     $show100{$amnt} = 0;
   }
 
-  foreach $user (@users) {
+  foreach my $user (@users) {
     print "<tr align=center><td class=\"grid\"><b>$user</b>";
-    foreach $amnt (@amnts) {
-      print "<td class=\"grid\">$scores{$amnt}{$user}</td>";
-      ($scores{$amnt}{$user} ne '-') && ($show{$amnt}++);
-      ($scores{$amnt}{$user} =~ '>100</a>$') && ($show100{$amnt}++);
+    foreach my $amnt (@amnts) {
+      print "<td class=\"grid\">$grades{$amnt}{$user}</td>";
+      ($grades{$amnt}{$user} ne '-') && ($show{$amnt}++);
+      ($grades{$amnt}{$user} =~ '>100</a>$') && ($show100{$amnt}++);
     }
     print '</tr>';
   }
 
-  $n = @users;
+  my $n = @users;
   print "<tr align=center>" . 
-    "<td class=\"grid\"><b>Total</b></td><td class=\"grid\" colspan=0>$n</td></tr>" .
+    "<td class=\"grid\" colspan=$n></td></tr>" .
     '<tr align=center><td class="grid"><b>Submetidos</b><br><b>%</b></td>';
 
-  foreach $amnt (@amnts) {
-    printf("<td class=\"grid\">%i<br>%.0f</td>",$show{$amnt},$n>0 ? 100*$show{$amnt}/$n : 0);
+  foreach my $amnt (@amnts) {
+    printf("<td class=\"grid\">%i / %i<br>%.0f</td>",
+	   $show{$amnt},$n,$n>0?100*$show{$amnt}/$n:0);
   }
 
   print '</tr><tr align=center><td class="grid"><b>100</b><br><b>%</b></td>';
-  foreach $amnt (@amnts) {
-    printf("<td class=\"grid\">%i<br>%.0f</td>",
-	   $show100{$amnt},$show{$amnt}>0 ? 100*$show100{$amnt}/$show{$amnt} : 0);
+  foreach my $amnt (@amnts) {
+    printf("<td class=\"grid\">%i / %i<br>%.0f</td>",
+	   $show100{$amnt},$show{$amnt},$show{$amnt}>0?100*$show100{$amnt}/$show{$amnt}:0);
   }
 
   print '</tr></table></div></div>';
-  print_end_html();
+  print_html_end();
 }
 
 
 
-
-################################################################################
+####################################################################################################
 sub submit_assignment {
 
-  my ($DIR, $MAKE, $REPORT, $SOURCE, $STATUS, $assign, $backupd,
-      $case, $case_out, $casei, $cmd, $compcmd, $date, $discount,
-      $elff, $errf, $exec_err, $exec_out, $exec_st, $fh, $full_score,
-      $href, $i, $j, $language, $ncases, $newd, $now, $outf, $passed,
-      $rep, $score, $scr, $source, $status, $tries, $uid, $upassf,
-      $userd, $utype, %cfg, %exts, %failed, %langs, %names, %rep,
-      @aux, @fh, @pdfs, @show, @sources, @test_cases, @uploads);
+  my $uid = $session->param('uid');
+  my $utype = $session->param('utype');
+  my $upassf = $session->param('upassf');
+  
+  my $assign = param('submassign');
+  my $language = param('language');
 
-  $uid = $session->param('uid');
-  $utype = $session->param('utype');
-  $upassf = $session->param('upassf');
-
-  $assign = param('submassign');
-  $language = param('language');
-  @uploads = param('source');
+  my @uploads = param('source');
   @uploads = grep(/\S+/,@uploads);
 
-  print_start_html(0,'saida',1);
+  my $dryrun = 0;
+  
+  print_html_start(0,'saida',1);
 
+  ### Checks:  
   # Check assign:
   (!$assign) && abort($uid,'',"Selecione um trabalho.");
 
@@ -928,37 +948,50 @@ sub submit_assignment {
 
   # Load system and assignment configs:
   (!%sys_cfg) && (%sys_cfg = load_keys_values('sqtpm.cfg'));
-  %cfg = (%sys_cfg, load_keys_values("$assign/config"));
+  my %cfg = (%sys_cfg, load_keys_values("$assign/config"));
 
-  # Check if the assignment is open:
-  ($utype eq 'A' && 
-   exists($cfg{deadline}) && elapsed_days($cfg{deadline})*$cfg{penalty} >= 100) && 
-   abort($uid,$assign,"O prazo para enviar $assign terminou.");
+  my $deaddays = exists($cfg{deadline}) ? elapsed_days($cfg{deadline}) : 0;
   
-  ($utype ne 'P' && exists($cfg{startup}) && elapsed_days($cfg{startup}) < 0) && 
-    block_user($uid,$upassf,"O prazo para enviar $assign não começou, bloqueado.");
-
+  # Check whether the assignment is open:
+  if ($utype eq 'S') {    
+    if (exists($cfg{deadline}) && $deaddays*$cfg{penalty} >= 100) {
+      if ($deaddays <= $cfg{'keep-open'}) { 
+	$dryrun = 1;
+      }
+      else {
+	abort($uid,$assign,"O prazo para enviar $assign terminou.");
+      }
+      
+      if (exists($cfg{startup}) && elapsed_days($cfg{startup}) < 0) {
+	block_user($uid,$upassf,"submit: o prazo para enviar $assign não começou.");
+      }
+    }
+  }
+  
   # Check language:
-  !$language && abort($uid,$assign,'Selecione uma linguagem.');
+  (!$language) && abort($uid,$assign,'Selecione uma linguagem.');
 
-  %langs = ('C'=>0,'C++'=>0,'Fortran'=>0,'Pascal'=>0,'PDF'=>0);
-  !exists($langs{$language}) && abort($uid,$assign,"$language não é válida no sqtpm.");
+  my %langs = ('C'=>0,'C++'=>0,'Fortran'=>0,'Pascal'=>0,'Python3'=>0,'PDF'=>0);
+  
+  (!exists($langs{$language})) && block_user($uid,$upassf,"submit: não há linguagem $language.");
 
   (!grep(/$language/,split(/\s+/,$cfg{languages}))) && 
-    abort($uid,$assign,"$assign não pode ser enviado em $language.");
+    block_user($uid,$upassf,"submit: $assign não pode ser enviado em $language.");
   
   # Check the number of uploading files and their names: 
-  @pdfs = grep(/\.pdf$/ && /^[0-9a-zA-Z\_\.\-]+$/,@uploads);
+  my @pdfs = grep(/\.pdf$/ && /^[0-9a-zA-Z\_\.\-]+$/,@uploads);
+  my %exts;
+  my @sources;
   
   if ($language eq 'PDF') {
-    ($cfg{sources} = '0,0');
-    (!exists($cfg{pdfs})) && ($cfg{pdfs} = '1,999');
+    $cfg{sources} = '0,0';
+    (!exists($cfg{pdfs})) && ($cfg{pdfs} = '1,1');
   }
   else {
     (!exists($cfg{pdfs})) && ($cfg{pdfs} = '0,0');
-    %exts = ('C'=>'(c|h)','C++'=>'(cpp|h)','Pascal'=>'pas','Fortran'=>'(f|F)');
+    %exts = ('C'=>'(c|h)','C++'=>'(cpp|h)','Pascal'=>'pas','Fortran'=>'(f|F)','Python3'=>'py');
     @sources = grep(/$exts{$language}$/ && /^[0-9a-zA-Z\_\.\-]+$/,@uploads);  
-    (!exists($cfg{sources})) && ($cfg{sources} = '1,999');
+    (!exists($cfg{sources})) && ($cfg{sources} = '1,9');
     # Pascal and Fortran are limited to a sigle source file:
     ($language eq 'Pascal' || $language eq 'Fortran') && ($cfg{sources} = '1,1');
   }
@@ -976,15 +1009,15 @@ sub submit_assignment {
 	  "<a href=\"javascript:;\" onclick=\"wrap('hlp','envio')\">página</a>.");
 
   if (exists($cfg{filenames})) {
-    %names = ();
-    @aux = split(/ +/,$cfg{filenames});
-    for ($i=0; $i<@aux; $i++) {
+    my %names = ();
+    my @aux = split(/ +/,$cfg{filenames});
+    for (my $i=0; $i<@aux; $i++) {
       $aux[$i] =~ s/\{uid\}/$uid/;
       $aux[$i] =~ s/\{assign\}/$assign/;
       $names{$aux[$i]} = 1;
     }
     if (keys(%names) > 0) {
-      for ($i=0; $i<@uploads; $i++) {
+      for (my $i=0; $i<@uploads; $i++) {
 	delete($names{$uploads[$i]});
       }
       (keys(%names) > 0) && abort($uid,$assign,"Envie arquivos com nomes: @aux.") ;
@@ -992,57 +1025,65 @@ sub submit_assignment {
   }
   
   # Read tries from the existing report file or set it to 0:
-  $tries = 0;
+  my $tries = 0;
   if (-e "$assign/$uid/$uid.rep") {
-    %rep = get_rep_data("$assign/$uid/$uid.rep");
+    my %rep = load_rep_data("$assign/$uid/$uid.rep");
     $tries = $rep{tries};
   }
 
+  # Submiting a non-updating assignment will only be possible if a valid submission 
+  # has been done previously:
+  ($dryrun && $tries == 0) &&
+    abort($uid,$assign,"O prazo para $assign terminou. Você não pode enviá-lo pela primeira vez.");
+  
   # Check the maximum number of submissions:
-  ($utype eq 'A' && $tries >= $cfg{tries}) && 
+  ($utype eq 'S' && $tries >= $cfg{tries}) && 
     abort($uid,$assign,"Você não pode enviar $assign mais uma vez.");
+  
+  ### Create a directory:
+  my $userd = "$assign/_${uid}_tmp_";
+  mkdir($userd) || abort($uid,$assign,"submit: mkdir " . cwd() . " $userd: $!");
+  
+
+  ### Report header:
+  my $rep = "<b>Usuário: $uid</b>";
+  $rep .= "\n<br><b>Trabalho: $assign</b>";
+
+  if (exists($cfg{deadline})) {
+    $rep .= "\n<br>Data limite para envio: $cfg{deadline}";
+    ($deaddays*$cfg{penalty} >= 100) && ($rep .= ' (encerrado)');
+    ($cfg{penalty} < 100) && ($rep .= "\n<br>Penalidade por dia de atraso: $cfg{penalty}%");
+  }
+
+  ($utype eq 'S' && $dryrun) && 
+    ($rep .= "\n<br><b>O prazo terminou. Este envio não será registrado.</b>");
+  
+  ($utype eq 'P') && ($rep .= "\n<br>$uid: envios sem restrições de linguagem e prazo.");
+
+  my $now = format_epoch(time);
 
   $tries++;
+  $rep .= "\n<br>Este envio: $tries&ordm;, $now";
 
-  # Create a directory:
-  $userd = "$assign/_${uid}_tmp_";
-  mkdir($userd) || abort($uid,$assign,"submit : mkdir $userd : $!");
- 
+  $rep .= "\n<br>Linguagem: $language";
+  $rep .= (@uploads == 1 ? "<br>Arquivo: " : "\n<br>Arquivos: ");
 
-  # Report header:
-  $rep = "<b>Usuário: $uid</b><br>\n";
-  $rep .= "<b>Trabalho: $assign</b><br>\n";
-  
-  if (exists($cfg{deadline})) {
-    $rep .= "Data limite para envio: $cfg{deadline}<br>\n";
-    ($cfg{penalty} < 100) && ($rep .= "Penalidade por dia de atraso: $cfg{penalty}%<br>\n");
-  }
-  
-  ($utype ne 'A') && ($rep .= "$uid: envios sem restrições de linguagem e prazo.<br>\n");
-  $rep .= "Número máximo de envios: $cfg{tries}<br>\n";
-
-  $now = format_epoch(time);
-  $rep .= "Este envio: $tries&ordm;, $now<br>\n", ;
-
-  $rep .= "Linguagem: $language<br>\n";
-  $rep .= (@uploads == 1 ? "Arquivo: " : "Arquivos: ");
-
-  # Upload source files and documents:
+  ### Get uploaded source files and documents:
   if (@pdfs) {
     %exts = ('PDF'=>'pdf', 'C'=>'(c|h|pdf)', 'C++'=>'(cpp|h|pdf)',
-	     'Pascal'=>'(pas|pdf)', 'Fortran'=>'(f|F|pdf)');
+	     'Pascal'=>'(pas|pdf)', 'Fortran'=>'(f|F|pdf)', 'Python3'=>'(py|pdf)');
   }
 
-  @fh = upload('source');    
+  my @fh = upload('source');
   @sources = ();
   @pdfs = ();
-  for ($i=0; $i<@fh; $i++) {
+  for (my $i=0; $i<@fh; $i++) {
     ($uploads[$i] !~ /\.$exts{$language}$/ || $uploads[$i] !~ /^[a-zA-Z0-9_\.\-]+$/) && next;
 
-    open($SOURCE,'>',"$userd/$uploads[$i]") || 
-      abort($uid,$assign,"submit : open $userd/$uploads[$i] : $!");
+    open(my $SOURCE,'>',"$userd/$uploads[$i]") || 
+      abort($uid,$assign,"submit: open $userd/$uploads[$i]: $!");
 
-    $fh = $fh[$i];
+    my $fh = $fh[$i];
     if ($uploads[$i] =~ /\.pdf$/) {
       binmode $SOURCE;
       while (<$fh>){
@@ -1065,199 +1106,207 @@ sub submit_assignment {
 
   @sources = sort { $a cmp $b } @sources;  
 
-  # Include links for sources and documents:
-  for ($i=0; $i<@sources; $i++) {
+  ### Include links for sources and documents:
+  for (my $i=0; $i<@sources; $i++) {
     $rep .= '<a href="javascript:;" ' . 
       "onclick=\"toggleDiv('$sources[$i]');\">$sources[$i]</a>&nbsp;";
   }
-  for ($i=0; $i<@pdfs; $i++) {
+  for (my $i=0; $i<@pdfs; $i++) {
     $rep .= '<a href="javascript:;" ' . 
       "onclick=\"wrap('dwn','$assign','$uid','$pdfs[$i]');\">$pdfs[$i]</a>&nbsp; ";
   }
 
-  # $href = $cgi->url();
-  # $href =~ s/\/[^\/]+$//;
-  # $href .= '/google-code-prettify';
-  $href .= 'google-code-prettify';
-  $rep .= "<link href=\"$href/prettify.css\" type=\"text/css\" rel=\"stylesheet\">" .
-    "<script type=\"text/javascript\" src=\"$href/run_prettify.js?61\"></script>";
-
-  # Include source files:
-  for ($i=0; $i<@sources; $i++) {
-    $rep .= "<div id=\"$sources[$i]\" style=\"display:none\" class=\"src\">" . 
+  $rep .= "\n<script type=\"text/javascript\" src=\"google-code-prettify/run_prettify.js?61\"></script>";
+  
+  ### Include source files:
+  for (my $i=0; $i<@sources; $i++) {
+    $rep .= "\n<div id=\"$sources[$i]\" style=\"display:none\" class=\"src\">" . 
       "<b>$sources[$i]</b>&nbsp;&nbsp;" . 
       "<a href=\"javascript:;\" onclick=\"wrap('dwn','$assign','$uid','$sources[$i]')\">download</a>";
 
-    $source = "$userd/$sources[$i]";
+    my $source = "$userd/$sources[$i]";
     if ($sources[$i] =~ /\.c$/ || $sources[$i] =~ /\.h$/) {
-      $rep .= '<pre class="prettyprint lang-c" id="C_lang">';
+      $rep .= "\n<pre class=\"prettyprint lang-c\" id=\"C_lang\">";
       if (-x "$cfg{indent}") {
 	system("$cfg{indent} -kr $source -o $source.indent 2>/dev/null");
-	$rep .= load($uid,$assign,"$source.indent",1);
+	$rep .= load_file($uid,$assign,"$source.indent",1);
       }
       else {
-	$rep .= '<pre class="prettyprint">';
-	$rep .= load($uid,$assign,"$source",1);
+	$rep .= load_file($uid,$assign,"$source",1);
       }
     }
     else {
-      $rep .= '<pre class="prettyprint">';
-      $rep .= load($uid,$assign,"$source",1);
+      $rep .= "\n<pre class=\"prettyprint\">";
+      $rep .= load_file($uid,$assign,"$source",1);
     }
     
-    $rep .= '</pre></div>'; 
+    $rep .= "\n</pre></div>"; 
   }
 
-  # If this is a PDF statement, there is nothing else to do:
+  my $grade;
+  my $full_grade;
+  my @test_cases = ();
+  
+  ### If this is a PDF statement, there is nothing else to do:
   if ($language eq 'PDF') {
-    $rep .= "<br>\nRecebido.<br>\n";
-    $score = 'recebido';
-    @test_cases = ();
+    if ($utype eq 'S' && exists($cfg{deadline}) && !$dryrun && $deaddays > 0) {
+      $rep .= "<b>Recebido com atraso de $deaddays " . ($deaddays>1 ? "dias" : "dia") . ".</b><br>";
+      $grade = "recebido +$deaddays";
+    }
+    else {
+      $rep .= "<b>Recebido.</b><br>";
+      $grade = 'recebido';
+    }
   }
   else {
     # Load test-case names early to produce correct messages for compiling errors:
-    opendir($DIR,"$assign") || abort($uid,$assign,"submit : opendir $assign : $!");
+    opendir(my $DIR,"$assign") || abort($uid,$assign,"submit: opendir $assign: $!");
     @test_cases = sort(grep {/\.in$/ && -f "$assign/$_"} readdir($DIR));
     close($DIR);
 
-    $ncases = @test_cases;
+    my $ncases = @test_cases;
 
-    for ($i=0; $i<$ncases; $i++) {
+    for (my $i=0; $i<$ncases; $i++) {
       $test_cases[$i] =~ s/\.in$//;
     }
 
-    $score = 0;
+    $grade = 0;
 
-    # Compile the program:
-    $rep .= '<p><b>Compilação:</b>&nbsp;';
-
+    # Compile:
+    $rep .= "\n<p><b>Compilação:</b>&nbsp;";
+    my $compcmd;
+    
     if ($language eq 'C') {
-      (!-x $cfg{gcc}) && abort($uid,$assign,"submit : $cfg{gcc} inválido");
-
+      (!-x $cfg{gcc}) && abort($uid,$assign,"submit: $cfg{gcc} inválido");
       (!exists($cfg{'gcc-args'})) && ($cfg{'gcc-args'} = '');
-      open($MAKE,'>',"$userd/Makefile") || 
-	abort($uid,$assign,"submit : write $userd/Makefile : $!");
+      
+      open(my $MAKE,'>',"$userd/Makefile") || 
+	abort($uid,$assign,"submit: write $userd/Makefile: $!");
 
-      print $MAKE "CC=$cfg{gcc}\n" .
-	'CFLAGS=' . $cfg{'gcc-args'} . "\n" .
-	'SRC=$(wildcard *.c)' . "\n" .
+      print $MAKE "CC = $cfg{gcc}\n" .
+	'CFLAGS = ' . $cfg{'gcc-args'} . "\n" .
+	'SRC = $(wildcard *.c)' . "\n" .
 	'elf: $(SRC:%.c=%.o)' . "\n" .
-	"\t" . '$(CC) ' . $cfg{'gcc-args'} . ' -o $@ $^' . "\n" .
-	"clean:\n" .
-	"\t/bin/rm -r *.o elf\n";
+	"\t" . '$(CC) $(CFLAGS) -o $@ $^' . "\n";
 
       close($MAKE);    
       $compcmd = "$cfg{'make'}";
     }
     elsif ($language eq 'C++') {
-      (!-x $cfg{'g++'}) && abort($uid,$assign,"submit : $cfg{'g++'} inválido");
+      (!-x $cfg{'g++'}) && abort($uid,$assign,"submit: $cfg{'g++'} inválido");
 
       (!exists($cfg{'g++-args'})) && ($cfg{'g++-args'} = '');
-      open($MAKE,'>',"$userd/Makefile") || 
-	abort($uid,$assign,"submit : write $userd/Makefile : $!");
-
-      print $MAKE "CC=$cfg{'g++'}\n" .
-	'SRC=$(wildcard *.cpp)' . "\n" .
+      open(my $MAKE,'>',"$userd/Makefile") || 
+	abort($uid,$assign,"submit: write $userd/Makefile: $!");
+      
+      print $MAKE "CC = $cfg{'g++'}\n" .
+	'CFLAGS = ' . $cfg{'g++-args'} . "\n" .
+	'SRC = $(wildcard *.cpp)' . "\n" .
 	'elf: $(SRC:%.cpp=%.o)' . "\n" .
-	"\t" . '$(CC) ' . $cfg{'g++-args'} . ' -o $@ $^' . "\n" .
-	"clean:\n" .
-	"\t/bin/rm -r *.o\n";
+	"\t" . '$(CC) $(CFLAGS) -o $@ $^' . "\n";
 
       close($MAKE);
       $compcmd = "$cfg{'make'}";
     }
     elsif ($language eq 'Fortran') {
-      (!-x $cfg{gfortran}) && abort($uid,$assign,"submit : $cfg{gfortran} inválido");
+      (!-x $cfg{gfortran}) && abort($uid,$assign,"submit: $cfg{gfortran} inválido");
 
       (!exists($cfg{'gfortran-args'})) && ($cfg{'gfortran-args'} = '');
       $compcmd = "$cfg{gfortran} $cfg{'gfortran-args'} $sources[0] -o elf";
     }
     elsif ($language eq 'Pascal') {
-      (!-x $cfg{gpc}) && abort($uid,$assign,"submit : $cfg{gpc} inválido");
+      (!-x $cfg{gpc}) && abort($uid,$assign,"submit: $cfg{gpc} inválido");
 
       (!exists($cfg{'gpc-args'})) && ($cfg{'gpc-args'} = '');
       $compcmd = "$cfg{gpc} $cfg{'gpc-args'} --executable-file-name=elf --automake $sources[0]";
     }
-    else {
-      block_user($uid,$upassf,"$language não existe, bloqueado.");
+    elsif ($language eq 'Python3') {
+      (!-x $cfg{python3}) && abort($uid,$assign,"submit: $cfg{python3} inválido");
+
+      (!exists($cfg{'python3-args'})) && ($cfg{'python3-args'} = '');
+      $compcmd = "$cfg{python3} -m py_compile $sources[0]";
     }
 
-    $status = system("cd $userd; $compcmd 1>out 2>err");
-    $elff = "$userd/elf";
-    $outf = "$userd/out";
-    $errf = "$userd/err";
+
+    my $status = system("cd $userd; $compcmd 1>out 2>err");
+    my $elff = "$userd/elf";
+    my $outf = "$userd/out";
+    my $errf = "$userd/err";
 
     if ($status) {
-      $rep .= 'com erros.<br>' . "<div class=\"io\">$compcmd<br>"; 
-      $rep .= load($uid,$assign,$outf,0);
-      $rep .= load($uid,$assign,$errf,0,2500);
-      $rep .= "</div><p>\n<b>Acerto:</b> 0%<br>\n";
-      $score = 0;
+      $rep .= 'com erros.<br>' . "\n<div class=\"io\">"; 
+      $rep .= load_file($uid,$assign,$outf,1);
+      $rep .= load_file($uid,$assign,$errf,1,2500);
+      $rep .= "</div>\n<p><b>Acerto:</b> 0%";
+      $grade = 0;
     }
     else {
       if (-s "$errf") {
-	$rep .= "com warnings.<br>" . "<div class=\"io\">$compcmd<br>"; 
-	$rep .= load($uid,$assign,$outf,0);
-	$rep .= load($uid,$assign,$errf,0,2500);
+	$rep .= "com warnings." . "\n<div class=\"io\">"; 
+	$rep .= load_file($uid,$assign,$outf,1);
+	$rep .= load_file($uid,$assign,$errf,1,2500);
 	$rep .= "</div>\n";
       }
       else {
-	$rep .= "bem sucedida.<br>\n";
+	$rep .= "bem sucedida.";
       }
 
       # No test cases:
       if ($ncases == 0) {
-	$rep .= "<p><b>Nenhum caso de teste.</b><br>";
+	$rep .= "<p><b>Nenhum caso-de-teste.</b><br>";
 
-	$score = $full_score = 100;	
-	$discount = 0;
-	if ($utype eq 'A' && exists($cfg{deadline})) {
-	  $discount = elapsed_days($cfg{deadline}) * $cfg{penalty} / 100;
-	  ($discount > 0) && ($score = $full_score * (1 - $discount));
-	  ($score < 0) && ($score = 0);
+	if ($utype eq 'S' && exists($cfg{deadline}) && !$dryrun && $deaddays > 0) {
+	  $rep .= "<b>Recebido com atraso de $deaddays " . ($deaddays>1 ? "dias" : "dia") . ".</b><br>";
+	  $grade = "recebido +$deaddays";
 	}
-
-	$rep .= "\n<b>Acerto:</b> " . sprintf("%.0f%%", $score);
-
-	if ($discount > 0 && $full_score > 0) {
-	  $rep .= sprintf(", desconto de %.0f%% sobre %.0f%% por atraso desde %s.", 
-			  100*$discount, $full_score, $cfg{deadline});
+	else {
+	  $rep .= "<b>Recebido.</b><br>";
+	  $grade = 'recebido';
 	}
-	$rep .= "<br>\n";
       }
 
       # Dispatch test cases execution:
       else {
-	$rep .= "<p><b>Execução dos casos-de-teste:</b><p>\n";
 
-	$cmd = "./sqtpm-etc.sh $uid $assign $cfg{cputime} $cfg{virtmem} $cfg{stkmem} >/dev/null 2>&1";
+	# Python requires renaming after compiling:
+	if ($language eq 'Python3') {
+	  @pyc = glob("$userd/__pycache__/*.pyc");
+	  rename($pyc[0],"$userd/elf") || abort($uid,$assign,"rename: $pyc[0] elf: $!");
+	  unlink(glob "$userd/__pycache__/*");
+	  rmdir("$userd/__pycache__") || abort($uid,$assign,"rmdir: $userd/__pycache__: $!");
+	}
+
+	$rep .= "\n<p><b>Execução dos casos-de-teste:</b>\n<p>";
+
+	my $cmd = "./sqtpm-etc.sh $uid $assign $language $cfg{cputime} $cfg{virtmem} $cfg{stkmem} >$userd/sqtpm-etc.txt 2>&1";
 	system($cmd);
-	$status = $? >> 8;
-	$status && abort($uid,$assign,"submit : system $cmd : $status : $!");
+
+	my $status = $? >> 8;
+	($status) && abort($uid,$assign,"submit: system $cmd (status $status): $!");
 
 	# Adjust verifier path:
 	(exists $cfg{verifier}) && ($cfg{verifier} =~ s/\@/$assign\//);
 
 	# Process every test case result:
-	%failed = ();
-	$passed = 0;
-	$casei = 1;
+	my %failed = ();
+	my $passed = 0;
+	my $casei = 1;
 
-	foreach $case (@test_cases) {
-	  
-	  $case_in = "$assign/$case.in";
-	  $case_out = "$assign/$case.out";
-	  $exec_st = "$userd/$case.run.st";
-	  $exec_out = "$userd/$case.run.out";
-	  $exec_err = "$userd/$case.run.err";
+	foreach my $case (@test_cases) {
+	  my $case_in = "$assign/$case.in";
+	  my $case_out = "$assign/$case.out";
+	  my $exec_st = "$userd/$case.run.st";
+	  my $exec_out = "$userd/$case.run.out";
+	  my $exec_err = "$userd/$case.run.err";
 
-	  (!-r $case_in) && abort($uid,$assign,"Erro ao ler $case_in.");
-	  (-s $exec_st && !-r $exec_st) && abort($uid,$assign,"Erro ao ler $exec_st.");
-	  (!-r $exec_out) && abort($uid,$assign,"Erro ao ler $exec_out.");
+	  (!-r $case_in) && abort($uid,$assign,"submit: sem permissão para $case_in.");
+	  (-s $exec_st && !-r $exec_st) && abort($uid,$assign,"submit: sem permissão para $exec_st.");
+	  (!-r $exec_out) && abort($uid,$assign,"submit: sem permissão para $exec_out.");
 
 	  $failed{$case} = $casei;
-
-	  if (open($STATUS,"<$exec_st")) {
+	  my $status;
+	  
+	  if (open(my $STATUS,'<',"$exec_st")) {
 	    $status = <$STATUS>;
 	    chomp($status);
 	    $status -= 128;
@@ -1267,7 +1316,7 @@ sub submit_assignment {
 	    $status = 9;
 	  }
 
-	  $rep .= sprintf("%.02d:&nbsp;",$casei);
+	  $rep .= sprintf("\n%.02d: &nbsp;",$casei);
 
 	  if ($status == 11) {
 	    $rep .= 'violação de memória.<br>';
@@ -1279,33 +1328,34 @@ sub submit_assignment {
 	    $rep .= 'erro de ponto flutuante.<br>';
 	  }
 	  elsif ($status > 0 || -s $exec_err) {
-	    (-s $exec_err && !-r $exec_err) && abort($uid,$assign,"Erro ao ler $exec_err.");
+	    (-s $exec_err && !-r $exec_err) && abort($uid,$assign,"submit: sem permissão para $exec_err.");
 	    $rep .= "erro de execução ($status).<br>";
 	    (-s $exec_err) && 
-	      ($rep .= '<div class="io">' . load($uid,$assign,$exec_err,0,1000) . "</div>\n");
+	      ($rep .= "\n<div class=\"io\">" . load_file($uid,$assign,$exec_err,0,1000) . "</div>\n");
 	  }
 	  else {
 	    if (exists($cfg{verifier})) {
-	      system("$cfg{verifier} $case_in $exec_out >/dev/null 2>&1");
+	      my $cmd = "$cfg{verifier} $case_in $exec_out >/dev/null 2>&1";
+	      system($cmd);
 	      $status = $? >> 8;
 
 	      if ($status == 0) {
-		$rep .= 'bem sucedido.<br>';
+		$rep .= "bem sucedido.<br>";
 		$failed{$case} = 0;
 		$passed++;
 	      }
 	      elsif ($status == 1) {
-		$rep .= 'saída incorreta.<br>';
+		$rep .= "saída incorreta.<br>";
 	      }
 	      elsif ($status == 2) {
 		$rep .= 'saída com formatação incorreta.<br>';
 	      }
 	      else {
-		abort($uid,$assign,'Erro ao executar o verificador.');
+		abort($uid,$assign,"submit: Erro ao executar o verificador $cmd.");
 	      }
 	    }
 	    else {
-	      (!-r $case_out) && abort($uid,$assign,"Erro ao ler $case_out.");
+	      (!-r $case_out) && abort($uid,$assign,"submit: sem permissão para $case_out.");
 
 	      system("$cfg{diff} -q $case_out $exec_out >/dev/null 2>&1");
 	      $status = $? >> 8;
@@ -1316,192 +1366,216 @@ sub submit_assignment {
 		$passed++;
 	      }
 	      elsif ($status == 1) {
-		system("$cfg{diff} -q -b -B -i -w $case_out $exec_out >/dev/null 2>&1");
+	        write_lc_file($uid,$assign,$case_out,-s $case_out);
+		write_lc_file($uid,$assign,$exec_out,-s "$case_out.lc");
+		
+		system("$cfg{diff} -q $case_out.lc $exec_out.lc >/dev/null 2>&1");
 		$status = $? >> 8;
-
+		
 		if ($status == 0) {
 		  $rep .= 'saída com formatação incorreta.<br>';
 		}
 		elsif ($status == 1) {
 		  $rep .= 'saída incorreta.<br>';
 		}
+		else {
+		  abort($uid,$assign,"submit: erro ao executar diff $case_out.lc $exec_out.lc.");
+	        }
 	      }
 	      else {
-		abort($uid,$assign,"Erro ao executar diff $case_out $exec_out.");
+		abort($uid,$assign,"submit: erro ao executar diff $case_out $exec_out.");
 	      }
 	    }
 	  }
 	  $casei++;
 	}
-
-	$rep .= "<br>Número de casos-de-teste: $ncases.<br>\n" .
-	  "Casos-de-teste bem sucedidos: $passed.<br>\n";
-
-	if ($cfg{'scoring'} eq 'total') {
-	  $full_score = ($passed == $ncases ? 100 : 0);
+	
+	$rep .= "\n<br>Número de casos-de-teste: $ncases." .
+	        "\n<br>Casos-de-teste bem sucedidos: $passed.";
+	
+	if ($cfg{'grading'} eq 'total') {
+	  $full_grade = ($passed == $ncases ? 100 : 0);
 	}
 	else {
-	  $full_score = $passed/$ncases*100;
+	  $full_grade = $passed/$ncases*100;
 	}
-
-	$score = $full_score;
-
-	$discount = 0;
-	if ($utype eq 'A' && exists($cfg{deadline}) && $score > 0) {
-	  $discount = elapsed_days($cfg{deadline}) * $cfg{penalty} / 100;
-	  $discount > 0 && ($score = $full_score * (1 - $discount));
-	  ($score < 0) && ($score = 0);
+	
+	$grade = $full_grade;
+	
+	my $discount = 0;
+	if ($utype eq 'S' && exists($cfg{deadline}) && $grade > 0 && !$dryrun) {
+	  $discount = $deaddays * $cfg{penalty} / 100;
+	  ($discount > 0) && ($grade = $full_grade * (1 - $discount));
+	  ($grade < 0) && ($grade = 0);
 	}
-
-	$rep .= "\n<b>Acerto:</b> " . sprintf("%.0f%%", $score);
-
-	if ($discount > 0 && $full_score > 0) {
+	
+	$rep .= "\n<br><b>Acerto:</b> " . sprintf("%.0f%%", $grade);
+	
+	if ($discount > 0 && $full_grade > 0) {
 	  $rep .= sprintf(", desconto de %.0f%% sobre %.0f%% por atraso desde %s.", 
-			  100*$discount, $full_score, $cfg{deadline});
+			  100*$discount, $full_grade, $cfg{deadline});
 	}
 	$rep .= "<br>\n";
 
-	# Show the cases that have failed and are supposed to be shown:
+	# Show the cases that failed and are supposed to be shown:
 	if (exists($cfg{showcases})) {
-	  @show = split(/\s+/,$cfg{showcases});
+	  my @show = split(/\s+/,$cfg{showcases});
 
-	  for ($i=0; $i<@show; $i++) {
+	  for (my $i=0; $i<@show; $i++) {
 	    if ($failed{$show[$i]}) {
+	      $rep .= sprintf("\n<br><b>Execução do caso %.02d:</b>",$failed{$show[$i]});
 
-	      $rep .= sprintf("<br><b>Execução do caso %.02d:</b><p>",$failed{$show[$i]});
-
-	      $rep .= 'Entrada:<br><div class="io">';
-	      $rep .= load($uid,$assign,"$assign/$show[$i].in",0);
-	      $rep .= "\n</div>";
+	      $rep .= "\n<p>Entrada:<br><div class=\"io\">";
+	      $rep .= load_file($uid,$assign,"$assign/$show[$i].in",0);
+	      $rep .= "</div>";
 
 	      if (!exists($cfg{verifier})) {
-		$rep .= '<p>Saída esperada:<br><div class="io">';
-		$rep .= load($uid,$assign,"$assign/$show[$i].out",0);
-		$rep .= "\n</div>";
+		$rep .= "\n<p>Saída esperada:<br><div class=\"io\">";
+		$rep .= load_file($uid,$assign,"$assign/$show[$i].out",0);
+		$rep .= "</div>";
 	      }
 
-	      $rep .= '<p>Saída produzida:<br><div class="io">';
+	      $rep .= "\n<p>Saída produzida:<br><div class=\"io\">";
 	      if (-f "$userd/$show[$i].run.out") {
-		$rep .= load($uid,$assign,"$userd/$show[$i].run.out",0,
+		$rep .= load_file($uid,$assign,"$userd/$show[$i].run.out",0,
 			     int((-s "$assign/$show[$i].out")*1.2));
 	      }
-	      $rep .= "\n</div>";
-	      $rep .= '<hr>';
+	      $rep .= "</div>";
+	      $rep .= "\n<hr>";
 	    }
 	  }
 	}
+	$grade = sprintf("%.0f%%",$grade);
       }
     }
-    $score = sprintf("%.0f%%",$score);
+    
+    ### Clean-up:
+    (-e $elff) && unlink($elff);  
+    (-e $outf) && unlink($outf);
+    (-e $errf) && unlink($errf);
+    
+    unlink(glob "$userd/*.o");
+    
+    foreach my $case (@test_cases) {
+      (-e "$userd/$case.run.st")  && unlink("$userd/$case.run.st");
+      (-e "$userd/$case.run.out") && unlink("$userd/$case.run.out");
+      (-e "$userd/$case.run.out.lc") && unlink("$userd/$case.run.out.lc");
+      (-e "$userd/$case.run.err") && unlink("$userd/$case.run.err");
+    }
   }
 
-  # Add data to parse easily later:
-  $rep = "<!--lang:$language-->\n" . "<!--score:$score-->\n" . 
-    "<!--tries:$tries-->\n" . "<!--at:$now-->\n" . $rep;
-
-  open($REPORT,'>',"$userd/$uid.rep") || abort($uid,$assign,"submit : write $userd/$uid.rep : $!");
-  print $REPORT $rep;
-  close($REPORT);
-
+  ### Add data to ease parsing the report later and a QED:
+  $rep = "<!--lang:$language-->\n<!--grade:$grade-->\n<!--tries:$tries-->\n<!--at:$now-->\n" . 
+         $rep .
+	 "<p>&#9744;";
+  
+  if (!$dryrun) {
+    open(my $REPORT,'>',"$userd/$uid.rep") || abort($uid,$assign,"submit: open $userd/$uid.rep: $!");
+    print $REPORT $rep;
+    close($REPORT);
+  }
+  
   print $rep;
   print end_html();
 
-  ## Clean-up:
-  ($outf && -e $outf) && unlink($outf);
-  ($errf && -e $errf) && unlink($errf);
+  # Remove grades report to force future update, if any:
+  my $tabfile = "$assign/grades.$upassf";
+  $tabfile =~ s/\.pass$//;
+  (-f $tabfile) && unlink($tabfile);
   
-  foreach $case (@test_cases) {
-    (-e "$userd/$case.run.st")  && unlink("$userd/$case.run.st");
-    (-e "$userd/$case.run.out") && unlink("$userd/$case.run.out");
-    (-e "$userd/$case.run.err") && unlink("$userd/$case.run.err");
-  }
+  ### Move previous assignment and rename $userd:
+  if (!$dryrun) {
+    if ($tries > 1) {
+      if ($cfg{backup} eq 'on') {
+	my $date = format_epoch((stat("$assign/$uid/$uid.rep"))[9]);
+	$date =~ s/[:\/]//g;
+	$date =~ s/ /-/g;
+	
+	my $backupd = "$assign/backup";
+	if (!-d $backupd) {
+	  (-e $backupd) && abort($uid,$assign,"submit: $backupd is a file");
+	  mkdir($backupd) || abort($uid,$assign,"submit: mkdir $backupd: $!");
+	}
 
-  (-e "$userd/Makefile") && (system("cd $userd; $cfg{'make'} clean 1>/dev/null 2>&1"));
-
-  # Move previous assignment and rename $userd:
-  $tries--;
-  if ($tries > 0) {
-    if ($cfg{backup} eq 'on') {
-
-      $date = format_epoch((stat("$assign/$uid/$uid.rep"))[9]);
-      $date =~ s/[:\/]//g;
-      $date =~ s/ /-/g;
-      
-      $backupd = "$assign/backup";
-      if (!-d $backupd) {
-	(-e $backupd) && abort($uid,$assign,"submit : $backupd is a file");
-	mkdir($backupd) || abort($uid,$assign,"submit : mkdir $backupd : $!");
+	$tries--;
+	rename("$assign/$uid","$backupd/$uid.$tries.$date") || 
+	  abort($uid,$assign,"submit: rename $assign/$uid $backupd/$uid.$tries.$date: $!");
       }
-      
-      $newd = "$backupd/$uid.$tries.$date";
-      rename("$assign/$uid",$newd) || abort($uid,$assign,"submit : mv $assign/$uid $newd : $!");
+      else {
+	unlink(glob "$assign/$uid/*");
+	rmdir("$assign/$uid");
+      }
     }
-    else {
-      unlink glob "$assign/$uid/*";
-      rmdir "$assign/$uid";
-    }
+    rename($userd,"$assign/$uid") || abort($uid,$assign,"submit: rename $userd $assign/$uid: $!");
   }
+  else {
+    unlink(glob "$userd/*");
+    rmdir("$userd");
 
-  rename($userd,"$assign/$uid") || abort($uid,$assign,"submit : mv '$userd' '$assign/$uid' : $!");
+    my $rep = load_file($uid,$assign,"$assign/$uid/$uid.rep",0);
+    $rep =~ s/--tries:\d+--/--tries:$tries--/;
+    
+    open(my $REPORT,'>',"$assign/$uid/$uid.rep") || 
+      abort($uid,$assign,"submit: open $assign/$uid/$uid.rep: $!");
+    print $REPORT $rep;
+    close($REPORT);
+  }
+  
+  ### Write log:  
+  add_to_log($uid,$assign,$grade);
 
-  # Write log:  
-  wlog($uid,$assign,$score);
-
-  if ($utype eq 'A') {
-    # Update home screen:
-    $scr = $session->param('screen');
-
-    $i = index($scr,">$assign<");
+  ### Update home screen:
+  if ($utype eq 'S' && !$dryrun) {
+    my $scr = $session->param('screen');
+    
+    my $i = index($scr,">$assign<");
     $i += index(substr($scr,$i),'<td ') + 3;
     ($utype eq 'P') && ($i += index(substr($scr,$i),'<td ') + 3);
     ($utype eq 'P') && ($i += index(substr($scr,$i),'<td ') + 3);
     $i += index(substr($scr,$i),'<td ') + 3;
     $i += index(substr($scr,$i),'<td ');
 
-    $j = index(substr($scr,$i),'<tr ');
+    my $j = index(substr($scr,$i),'<tr ');
     ($j == -1) && ($j = index(substr($scr,$i),'</table>'));
     $j += $i;
-  
-    $session->param('screen',substr($scr,0,$i) . 
-	       "<td class=\"grid\"><a href=\"javascript:;\" onclick=\"wrap('rep','$assign');\">" . 
-		  "$score</a></td>" . substr($scr,$j));
+    
+    $session->param('screen', 
+		    substr($scr,0,$i) . "<td class=\"grid\"><a href=\"javascript:;\"" .
+		    " onclick=\"wrap('rep','$assign');\">$grade</a></td>" . substr($scr,$j));
   }
 }
 
 
 
+####################################################################################################
+sub invoke_moss {
 
-################################################################################
-sub moss {
+  my $uid = shift;
+  my $assign = shift;
+  my $recursive = shift;
 
-  my ($assign, $cmd, $url, $i, $recursive, $run_age, $st, $uid, @out);
+  (!$recursive) && print_html_start();
 
-  $uid = shift;
-  $assign = shift;
-  $recursive = shift;
-
-  %sys_cfg = load_keys_values('sqtpm.cfg');
-
-  (!$recursive) && print_start_html();
+  (!%sys_cfg) && (%sys_cfg = load_keys_values('sqtpm.cfg'));
   
-  @sources = ();
+  @gsources = ();  # @gsources is modified by wanted_moss.
   find(\&wanted_moss,"./$assign");
 
-  (@sources < 2) && abort($uid,$assign,"Deve haver pelo menos dois arquivos para comparar.");
+  (@gsources < 2) && abort($uid,$assign,"Deve haver pelo menos dois arquivos para comparar.");
 
-  $url = '';
+  my $url = '';
+  
   if (-f "$assign/moss.run") {
-
     # Check if last moss run is up and whether there is a newer source:
-    open(OUT,"<","$assign/moss.run") || abort($uid,$assign,"moss : open $assign/moss.run : $!");
-    @out = <OUT>;
-    close(OUT);
+    open(my $OUT,'<',"$assign/moss.run") || abort($uid,$assign,"moss: open $assign/moss.run: $!");
+    my @out = <$OUT>;
+    close($OUT);
     $url = $out[-1];
 
-    if (head("$url")) {
-      $run_age = (stat "$assign/moss.run")[9];
-      for ($i=0; $i<@sources; $i++) {
-	if ($run_age < (stat $sources[$i])[9]) {
+    if (LWP::Simple::head("$url")) {
+      my $run_age = (stat "$assign/moss.run")[9];
+      for (my $i=0; $i<@gsources; $i++) {
+	if ($run_age < (stat $gsources[$i])[9]) {
 	  $url = '';
 	  last;
 	}
@@ -1513,48 +1587,85 @@ sub moss {
   }
 
   if ($url eq '') {
-    open(LOCK,'>',"$assign/moss.lock") || abort($uid,$assign,"moss : open $assign/moss.lock : $!");
-    flock(LOCK,LOCK_EX|LOCK_NB) || abort($uid,$assign,"Comparando $assign, aguarde.");
-      
-    $cmd = "perl moss-sqtpm $sys_cfg{'moss-id'} -m $sys_cfg{'moss-m'} " .
-      "-d @sources 1>$assign/moss.run 2>$assign/moss.err";
+    my $LOCK;
+    open($LOCK,'>',"$assign/moss.lock") || abort($uid,$assign,"moss: open $assign/moss.lock: $!");
+    flock($LOCK,LOCK_EX|LOCK_NB) || abort($uid,$assign,"Comparando $assign, aguarde.");
+    
+    my $cmd = "perl moss-sqtpm $sys_cfg{'moss-id'} -m $sys_cfg{'moss-m'} " .
+      "-d @gsources 1>$assign/moss.run 2>$assign/moss.err";
     system($cmd);
-    $st = $? >> 8;
+    my $st = $? >> 8;
 
-    flock(LOCK,LOCK_UN);
-    close(LOCK);
+    flock($LOCK,LOCK_UN);
+    close($LOCK);
     unlink("$assign/moss.lock");
 
-    $st && abort($uid,$assign,"moss : system $cmd : $!.");
+    ($st) && abort($uid,$assign,"moss: system $cmd: $!");
 
-    open(OUT,"<","$assign/moss.run") || abort($uid,$assign,"moss : open $assign/moss.run : $!");
-    @out = <OUT>;
+    open(my $OUT,'<',"$assign/moss.run") || abort($uid,$assign,"moss: open $assign/moss.run: $!");
+    my @out = <OUT>;
     close(OUT);
     $url = $out[-1];
 
     if ($url !~ /^http:/) {
       unlink("$assign/moss.run");
-      moss($uid,$assign,1);
+      invoke_moss($uid,$assign,1);
       abort($uid,$assign,"A execução do Moss falhou.");
     }
   }
   
   # Redirect:
-  print "<meta http-equiv=\"refresh\" content=\"0; url=$url\" />";
-  print_end_html();
+  print "<meta http-equiv=\"refresh\" content=\"0; url=$url\">";
+  print_html_end();
 }
 
 
 
+####################################################################################################
+# A wanted function to find sources for moss.  It uses @sources from
+# an outer scope.
 
-################################################################################
-# print_start_html($first_login,$help,$back)
+sub wanted_moss {
+  -f && 
+  !($File::Find::name =~ /\/backup\//) && 
+  (/\.c$/ || /\.cpp$/ || /\.h$/ || /\.pas$/ || /\.f$/ || /\.F$/ || /\.py$/) && 
+  (push(@gsources,"$File::Find::name"));
+}
+
+
+
+####################################################################################################
+# A wanted function to collect data for the histogram.  Each report
+# file for a user in %gusers is visited and (submission date, grade, user) 
+# are pushed into @ggrades.
+
+sub wanted_hist {
+  
+  /\.rep$/ && do {
+    my $file = $_;
+    /^(\w+)\./;
+
+    (!$1 || (!exists($gusers{$1}) && !exists($gusers{"*$1"}))) && return;
+
+    my %rep = load_rep_data($file);
+    push(@ggrades,(split(/ /,$rep{at}))[0]);
+    push(@ggrades,$rep{grade});
+    push(@ggrades,$1);
+  };
+
+  return;
+}
+
+
+
+####################################################################################################
+# print_html_start($first-login, $help, $back-link)
 #
-# first_login: 1 if the session is starting, 0 if it existed already.
+# first-login: 1 if the session is starting, 0 if it existed already.
 # help: the help html file.
-# back link: 0 or null is back to previous page, 1 is forced back to sqtpm.cgi.
+# back-link: 0 or null is back to previous page, 1 is forced back to sqtpm.cgi.
 
-sub print_start_html {
+sub print_html_start {
 
   my $first_login = shift;
   my $help = shift;
@@ -1567,13 +1678,21 @@ sub print_start_html {
     print header();
   }
 
-  print start_html(-title=>'sqtpm', -style=>{-src=>['sqtpm.css'], -media=>'all'},
-		   -head=>[Link({-rel=>'icon',-type=>'image/png',-href=>'icon.png'})]);
+  if ($help && $help eq 'saida') {
+    print start_html(-title=>'sqtpm', 
+		     -style=>{-src=>['sqtpm.css','google-code-prettify/prettify.css']},
+		     -head=>[Link({-rel=>'icon',-type=>'image/png',-href=>'icon.png'})]);
+  }
+  else {
+    print start_html(-title=>'sqtpm', 
+		     -style=>{-src=>['sqtpm.css']},
+		     -head=>[Link({-rel=>'icon',-type=>'image/png',-href=>'icon.png'})]);
+  }
   
   print '<div id="wrapper"><div id="sidebar"><h1>sqtpm</h1>';
-  print '<p style="margin-top:-15px"><small>[',substr($session->param('uid'),0,7),']</small></p>';
-  $help && print "<a href=\"javascript:;\" onclick=\"wrap('hlp','$help')\">ajuda</a><br>";
-    
+  print '<p style="margin-top:-15px"><small>[',substr($session->param('uid'),0,13),']</small></p>';
+  ($help) && print "<a href=\"javascript:;\" onclick=\"wrap('hlp','$help')\">ajuda</a><br>";
+  
   if ($help && $help eq 'envio') {
     print '<a href="javascript:;" onclick="wrap(\'out\');">sair</a>';
   }
@@ -1597,56 +1716,75 @@ sub print_start_html {
 
 
 
+####################################################################################################
+# print_html_end()
 
-################################################################################
-# sub print_end_html(help)
+sub print_html_end {
 
-sub print_end_html() {
-
-  print '</form></div>';
+  print '</form></div></div>';
   print end_html();
 }
 
 
 
-
-################################################################################
-# check_assign_access(user,pass_file,assignment)
+####################################################################################################
+# print_html_file($path, $file)
 #
-# Verify whether the user in the .pass file may access an assignment,
-# blocking the user if he may not.
+# Print an html file to stdout, encoding image files in base64 and printing them too.
+# If an error occurs while opening a file then it invokes abort().
 
-sub check_assign_access {
+sub print_html_file {
 
-  my $uid = shift;
-  my $upassf = shift;
-  my $assign = shift;
+  my $path = shift;
+  my $file = shift;
 
-  (-d $assign && -e "$assign/$upassf") && (return 1);
+  ($path) && ($path = "$path/");
 
-  block_user($uid,$upassf,"$upassf não está em $assign, bloqueado.");
+  open(my $HTML,'<',"$path$file") || abort('','',"print_html_file: open $path$file: $!");
+
+  while (<$HTML>) {
+    /<img / && / src=\"([^\"]*)\"/ && do {
+   
+      my $fig = $1;
+      my $type = (split(/\./,$fig))[-1];
+
+      ($fig !~ /^\//) && ($fig = "$path$fig");
+
+      open(my $FIG,'<',$fig) || abort('','',"print_html_file: open $fig: $!");
+      
+      binmode($FIG);
+      my $image = do { local $/; <$FIG> };
+      close($FIG);
+      
+      $enc = encode_base64($image);
+
+      s{ src=\"([^\"]*)\"}{ src=\"data:image/${type};base64,${enc}\"};
+    };
+
+    print $_;
+  }
+
+  close($HTML);
 }
 
 
 
-
-################################################################################
-# block_user(user,pass_file,messsage)
+####################################################################################################
+# block_user($user, $pass_file, $messsage)
 #
-# Block user in .pass file and logout silently, writing the message to the log.
+# Block a user by commenting its line in the pass file, write message
+# to the log and silently logout.
 
 sub block_user {
 
-  my ($PASS, $lines, $mess, $uid, $upassf);
+  my $uid = shift;
+  my $upassf = shift;
+  my $mess = shift;
 
-  $uid = shift;
-  $upassf = shift;
-  $mess = shift;
+  my $PASS;
+  open($PASS,'+<',$upassf) || abort($uid,,"block_user: open $upassf");
 
-  # If the user may not see the assignment, block him and logout:
-  $lines = '';
-  open($PASS,'+<',$upassf);
-    
+  my $lines = '';
   while (<$PASS>) {
     (/^([\*\@]?)$uid:?/) && ($_ = "# blocked! $_");
     $lines .= $_;
@@ -1658,237 +1796,7 @@ sub block_user {
   flock($PASS,LOCK_UN);
   close($PASS);
 
-  wlog($uid,$upassf,$mess);
+  add_to_log($uid,$upassf,"$mess Bloqueado.");
   $session->delete();
   exit(0);
-}
-
-
-
-
-################################################################################
-# A wanted function to find sources for moss.  It uses @sources from
-# an outer scope.
-
-sub wanted_moss {
-  -f && 
-    !($File::Find::name =~ /\/backup\//) && 
-    (/\.c$/ || /\.cpp$/ || /\.h$/ || /\.pas$/ || /\.f$/ || /\.F$/|| /\.py$/) && 
-    (push(@sources,"$File::Find::name"));
-}
-
-
-
-
-################################################################################
-# A wanted function to collect data for the histogram, using %users
-# and @grades from an outer scope.
-
-sub wanted_hist {
- 
-  /\.rep$/ && do {
-    my $file = $_;
-    /^(\w+)\./;
-
-    !exists($users{$1}) && !exists($users{"*$1"}) && return;
-
-    %rep = get_rep_data($file);
-    push(@grades,(split(/ /,$rep{at}))[0]);
-    push(@grades,$rep{score});
-  };
-
-  return;
-}
-
-
-
-
-################################################################################
-# histogram($png_file, $png_width, $png_height, \%data1, \%data2)
-# 
-# A histogram for two data series.  Each data series is a hash with
-# keys -> value.  The data series must have the same set of keys.  The
-# values in the second data series should be smaller than those in the
-# first.
-#
-# This function was written in 1999 or 2000 for a single series and
-# adapted for two series.
-
-sub histogram {
-
-  my ($aux, $aux1, $bar_separation, $black, $blue, $darkgreen,
-      $data1, $data2, $filled_x, $filled_y, $free_axis_end, $gray, $i, $im,
-      $l, $max_x, $max_y, $pairs_total, $png_file, $png_height, $png_width,
-      $purple, $red, $tfh, $tfw, $up_text, $value, $white, $x_margin,
-      $x_scale, $x_text_area, $x_zero, $y_margin, $y_scale, $y_text_area,
-      $y_zero, @x, @y);
-
-  $png_file = shift;
-  $png_width = shift;
-  $png_height = shift;
-  $data1 = shift;
-  $data2 = shift;
-
-  $im = new GD::Image($png_width,$png_height);
-
-  $white = $im->colorAllocate(255,255,255);
-  $black = $im->colorAllocate(0,0,0);
-  $red = $im->colorAllocate(180,0,0);
-  $darkgreen = $im->colorAllocate(0,180,0);
-  $blue = $im->colorAllocate(0,0,220);
-  $gray = $im->colorAllocate(225,225,225);
-  $purple = $im->colorAllocate(146,50,172);
-
-  ($tfw,$tfh) = (gdSmallFont->width,gdSmallFont->height);
-  
-  # Draw a border:
-  $im->rectangle(0,0,$png_width-1,$png_height-1,$black);
-  $im->fill(1,1,$gray);
-
-  ### Find maximum in y:
-  $max_y = 0;
-  $max_x = 0; 
-  $pairs_total = 0;
-  foreach $value (keys(%$data1)) {
-    $pairs_total++;
-    $l = length($value);
-    if ($max_x < $l) {
-      $max_x = $l;
-    }
-    if ($max_y < $$data1{$value}) {
-      $max_y = $$data1{$value};
-    }
-  }
-
-  ### Set margins and such:
-  $x_margin = 10;
-  $y_margin = 10;
-  $free_axis_end = 5;
-  $y_text_area = 4+(length("$max_y")*$tfw);
-  $x_text_area = 4+($max_x*$tfw);
-
-  ### Eval x and y scales:
-  $x_scale = ($png_width-(2*$x_margin)-$y_text_area-(2*$free_axis_end)) / $pairs_total;
-
-  ($x_scale > 40) && ($x_scale = 40);
-
-  $up_text = 0;
-  if ($x_scale < $max_x*1.2*$tfw) {
-    $up_text = 1;
-    $x_text_area = $max_x*1.2*$tfw;
-  }
-  else{
-    $up_text = 0;
-    $x_text_area = 20;
-  }
-
-  $y_scale = ($png_height-(2*$y_margin)-(2*$free_axis_end)-$x_text_area) / $max_y;
-    
-
-  ### Print y axis:
-  $x_zero = $x_margin + $free_axis_end + $y_text_area;
-  $y_zero = $png_height - $y_margin - $free_axis_end - $x_text_area;
-
-  $im->line($x_zero, 
-	    $y_margin, 
-	    $x_zero,
-	    $png_height - $y_margin, 
-	    $black);
-
-  ### Print x axis:
-  $im->line($x_margin, 
-		 $y_zero,
-		 $png_width - $x_margin, 
-		 $y_zero,
-		 $black);
-
-  ### Print y values:
-  @y = values(%$data1);
-  push(@y,values(%$data2));
-  $filled_y = 0;
-  $aux1 = length("$max_y");
-  foreach $value (sort {$b <=> $a} @y) {
-
-    if ($value > 0) {
-      $im->rectangle($x_zero - 3, 
-		     $y_zero-$value*$y_scale, 
-		     $x_zero, 
-		     $y_zero-$value*$y_scale, 
-		     $black);
-      
-      if ($y_zero-($value*$y_scale)-$tfh > $filled_y && 
-	  $y_zero-($value*$y_scale)-$tfh < $y_zero - 1.5*$tfh) {
-	
-	$aux = sprintf("%${aux1}i",$value);
-	$im->string(gdSmallFont, $x_margin + $free_axis_end, 
-		    $y_zero-$value*$y_scale-($tfh/2), 
-		    "$aux",$blue);
-	$filled_y = $y_zero-$value*$y_scale;
-      }
-    }
-  }
-
-  $bar_separation = 7;
- 
-  ### Print x values:
-  @x = sort {$a cmp $b} keys(%$data1);
-  $filled_x = $x_zero;
-  $aux1 = $max_x;
-  $i = 1;
-
-  if (!$up_text) {
-    foreach $value (@x) {
-      $im->string(gdSmallFont, 
-		  $x_zero+($bar_separation/2)+(($i-1)*$x_scale)+($x_scale/2)
-		  -(length("$value")*$tfw/2), 
-		  $y_zero+$tfh, 
-		  "$value",
-		  $blue);
-      $i++;
-    }
-  }
-  else{
-    foreach $value (@x) {
-      $aux = sprintf("%${aux1}s",$value);
-      $im->stringUp(gdSmallFont, 
-		    $x_zero+($bar_separation/2)+(($i-1)*$x_scale)+($x_scale/2)
-		    -$tfh/2,
-		    $png_height-$y_margin-$free_axis_end, 
-		    "$aux",
-		    $blue);
-      $i++;
-    }
-  }
-
-  ### Print bars for data1:
-  $i = 1;
-  $value = 0;
-  foreach $value (sort {$a cmp $b} keys(%$data1)) {
-    $im->filledRectangle($x_zero + $bar_separation + (($i-1)*$x_scale),
-			 $y_zero,
-			 $x_zero + ($i*$x_scale),
-			 $y_zero - ($$data1{$value}*$y_scale),
-			 $black);
-    $i++;
-  }
-
-  ### Print bars for data2:
-  $i = 1;
-  $value = 0;
-  foreach $value (sort {$a cmp $b} keys(%$data2)) {
-
-    $$data2{$value} > 0 && 
-    $im->filledRectangle($x_zero + $bar_separation + (($i-1)*$x_scale)+1,
-			 $y_zero - 1,
-			 $x_zero + ($i*$x_scale)-1,
-			 $y_zero - ($$data2{$value}*$y_scale) +1,
-			 $darkgreen);
-    $i++;
-  }
-
-
-  ### Drop to the file:
-  open(PNG, ">$png_file") || die("Unable to write $png_file");
-  print PNG $im->png;
-  close(PNG);
 }

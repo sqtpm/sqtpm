@@ -1,28 +1,31 @@
 #!/bin/bash
 
-# Host-side test-cases execution dispatcher for VirtualBox with shared
-# directory.
+# Host-side execution dispatcher for VirtualBox with a shared directory.
 # This file is part of sqtpm.
 
 sharedd='/mnt/aux'
 
 uid=$1
 assign=$2
-cputime=$3
-virtmem=$4
-stkmem=$5
+lang=$3
+cputime=$4
+virtmem=$5
+stkmem=$6
 
+# Bail out if sqtpm VM is not registered:
 st=`/usr/bin/vboxmanage showvminfo sqtpm 2>/dev/null` 
 if [[ $? -ne 0 ]]; then
+  #echo $st >vm-showinfo.txt
   exit 129;
 fi
 
+# Bail out if sqtpm VM is off:
 st=`echo "$st" | grep "^State" | sed -e "s/  */ /g" | cut -f 2 -d ' '`
 if [[ "$st"  == "powered" ]]; then 
   exit 131;
 fi
 
-# If the vm is paused, try to resume it:
+# If sqtpm VM is paused, try to resume it:
 if [[ "$st"  == "paused" ]]; then 
   vboxmanage controlvm sqtpm resume
   sleep 3
@@ -39,6 +42,10 @@ tmpd="$sharedd/$dir"
 userd="_${uid}_tmp_"
 
 mkdir $tmpd
+if [[ $? -ne 0 ]]; then
+  echo "mkdir $tmpd failed."
+  exit 129
+fi
 
 cd $assign &>/dev/null
 
@@ -53,7 +60,7 @@ for inputf in *.in; do
     \cp -r extra-files/* $tmpd
   fi
 
-  vboxmanage guestcontrol sqtpm --username sqtpm --password senha run --exe /home/sqtpm/vbox-etc-shared.sh --wait-stdout --wait-stderr -- vbox-etc-shared.sh $dir $inputf $cputime $virtmem $stkmem
+  vboxmanage guestcontrol sqtpm --username sqtpm --password senha run --exe /home/sqtpm/vbox-etc-shared.sh --wait-stdout --wait-stderr -- vbox-etc-shared.sh $dir $inputf $lang $cputime $virtmem $stkmem
 
   tag=${inputf/.in/}
   \mv $tmpd/$tag.run.{out,err,st} $userd
