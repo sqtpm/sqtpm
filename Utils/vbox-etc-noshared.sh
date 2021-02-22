@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# VM-side execution dispatcher for VirtualBox without a shared directory.
+# VM-side executor for VirtualBox without a shared directory.
 # This file is part of sqtpm.
 
 dir=$1

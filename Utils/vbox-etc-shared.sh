@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# VM-side execution dispatcher for VirtualBox with a shared directory.
+# VM-side executir for VirtualBox with a shared directory.
 # This file is part of sqtpm.
 
 sharedd=/media/sf_aux
