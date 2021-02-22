@@ -1278,7 +1278,7 @@ sub submit_assignment {
 
 	$rep .= "\n<p><b>Execução dos casos-de-teste:</b>\n<p>";
 
-	my $cmd = "./sqtpm-etc.sh $uid $assign $language $cfg{cputime} $cfg{virtmem} $cfg{stkmem} >$userd/sqtpm-etc.txt 2>&1";
+	my $cmd = "./sqtpm-etc.sh $uid $assign $language $cfg{cputime} $cfg{virtmem} $cfg{stkmem} >/dev/null 2>&1";
 	system($cmd);
 
 	my $status = $? >> 8;
