@@ -1,8 +1,7 @@
 #!/usr/bin/perl
 
-# Removes expired sqtpm sessions.  If no session is left returns 1,
-# otherwise returns 0.
-
+# Remove expired sqtpm sessions. If no session is left it returns 1,
+# otherwise it returns 0.
 # Guilherme P. Telles, 2015.
 
 use File::Find;
@@ -15,9 +14,7 @@ find(\&wanted,SESSION_DIR);
 
 exit($left ? 0 : 1);
 
-
 sub wanted {
-
   !/^sqtpm-sess-.*/ && return;
 
   open(my $fh,'<',SESSION_DIR . $_) or die("Unable to open $_ : $!");

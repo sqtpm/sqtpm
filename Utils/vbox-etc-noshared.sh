@@ -1,9 +1,13 @@
 #!/bin/bash
 
+# VM-side executor for VirtualBox without a shared directory.
+# This file is part of sqtpm.
+
 dir=$1
-cputime=$2
-virtmem=$3
-stkmem=$4
+lang=$2
+cputime=$3
+virtmem=$4
+stkmem=$5
 
 cd $dir &>/dev/null
 umask 0000
@@ -12,7 +16,11 @@ chmod u+x elf
 
 for case in `ls *.in`; do
   tag=${case/.in/}
-  bash -c "ulimit -c 0 -t $cputime -v $virtmem -s $stkmem; ./elf <$case 1>$tag.run.out 2>$tag.run.err; echo \$? >$tag.run.st"
+  if [[ "$lang"  == "Python3" ]]; then 
+    bash -c "ulimit -c 0 -t $cputime -v $virtmem -s $stkmem; python3 ./elf <$case 1>$tag.run.out 2>$tag.run.err; echo \$? >$tag.run.st"
+  else
+    bash -c "ulimit -c 0 -t $cputime -v $virtmem -s $stkmem; ./elf <$case 1>$tag.run.out 2>$tag.run.err; echo \$? >$tag.run.st"
+  fi    
 done
 
 
